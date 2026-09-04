@@ -639,18 +639,41 @@ def _scene_target(
 # AUDIO / SCENE DURATION
 # ----------------------------------------------------------------------
 
+# Minimum on-screen time for a scene, even when the TTS clip is very
+# short. Gives the viewer time to actually see the screenshot, watch
+# the cursor glide + click, and read the caption instead of the frame
+# flashing past. Actions get more floor than explanations because they
+# also have to fit the ~0.8s cursor-move-and-click animation.
+MIN_SCENE_SECONDS = {
+    "action": 2.6,
+    "explanation": 2.0,
+    "topic": 1.6,
+}
+
+# Extra breathing room added on top of the raw narration length so
+# pacing doesn't feel rushed even when the TTS engine speaks quickly.
+SCENE_PADDING_SECONDS = 0.5
+
+
 def _audio_duration_for_scene(
     scene: Dict[str, Any],
     index: int,
     audio_paths: List[str],
 ) -> float:
 
+    kind = scene.get("kind", "action")
+    floor = MIN_SCENE_SECONDS.get(kind, 2.0)
+
     # The most reliable mapping is a direct audio index.
     if index < len(
         audio_paths
     ):
-        return _duration(
+        raw = _duration(
             audio_paths[index]
+        )
+        return max(
+            floor,
+            raw + SCENE_PADDING_SECONDS,
         )
 
     narration = (
@@ -670,20 +693,17 @@ def _audio_duration_for_scene(
             str(narration).split()
         )
 
-        return max(
-            1.2,
-            min(
-                8.0,
-                words / 2.5,
-            ),
+        estimate = min(
+            8.0,
+            words / 2.5,
         )
 
-    if scene.get(
-        "kind"
-    ) == "topic":
-        return 2.0
+        return max(
+            floor,
+            estimate + SCENE_PADDING_SECONDS,
+        )
 
-    return 2.0
+    return floor
 
 
 # ----------------------------------------------------------------------

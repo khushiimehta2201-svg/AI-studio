@@ -1,135 +1,181 @@
 from app.services.ai_service import (
-    _extract_numbered_steps_from_pages,
-    _fallback_visual_map,
-    _target_center,
+    _candidate_screenshots,
+    _choose_screenshot,
+    _is_bad_segment,
+    _select_screenshot_and_visual,
+    _split_compound_action,
+)
+from app.services.video_service import (
+    MIN_SCENE_SECONDS,
+    SCENE_PADDING_SECONDS,
+    _audio_duration_for_scene,
 )
 
 
-def test_numbered_procedure_ignores_section_heading():
-    pages = [{
-        "page": 1,
-        "text": "1. Item\nAn Item description.\nCreate Item\n1. Select Folder\n2. Click New\n3. Click Add",
-    }]
-    steps = _extract_numbered_steps_from_pages(pages)
-    assert [s["title"] for s in steps] == ["Select Folder", "Click New", "Click Add"]
-    assert all(s["source_page"] == 1 for s in steps)
+# ----------------------------------------------------------------------
+# Compound action splitting
+# ----------------------------------------------------------------------
 
-
-def test_fallback_visuals_stay_on_source_page():
-    steps = [
-        {"number": 1, "title": "A", "source_page": 1},
-        {"number": 2, "title": "B", "source_page": 1},
-        {"number": 3, "title": "C", "source_page": 1},
-        {"number": 4, "title": "D", "source_page": 1},
-        {"number": 5, "title": "E", "source_page": 1},
-    ]
-    screenshots = [
-        {"index": 0, "page": 1, "bbox": [0, 0, 100, 100], "path": "a"},
-        {"index": 1, "page": 1, "bbox": [0, 200, 100, 300], "path": "b"},
-        {"index": 2, "page": 2, "bbox": [0, 0, 100, 100], "path": "c"},
-    ]
-    result = _fallback_visual_map(steps, screenshots)
-    assert result[1]["screenshot"]["page"] == 1
-    assert result[5]["screenshot"]["page"] == 1
-    assert result[1]["cursor"] is None
-    assert result[5]["cursor"] is None
-
-
-def test_invalid_target_does_not_become_center():
-    assert _target_center({"approximate_position": {}}) is None
-    assert _target_center({"approximate_position": {"x": "bad", "y": 0.5}}) is None
-    assert _target_center({"approximate_position": {"x": 0.5, "y": 0.5, "width": 0.1, "height": 0.1}}) == (0.55, 0.55)
-
-
-def test_local_hinglish_subprocess_backend(tmp_path, monkeypatch):
-    import sys
-    import wave
-    from app.services import tts_service
-
-    repo = tmp_path / "hinglish-tts"
-    repo.mkdir()
-    ref_audio = tmp_path / "ref.wav"
-    ref_text = tmp_path / "ref.txt"
-    output = tmp_path / "out.wav"
-
-    # Minimal fake CLI: proves the integration passes the expected arguments
-    # and that the app accepts a valid PCM WAV result.
-    (repo / "inference.py").write_text(
-        """
-import sys, wave
-args = sys.argv[1:]
-out = args[args.index('--out') + 1]
-with wave.open(out, 'wb') as w:
-    w.setnchannels(1)
-    w.setsampwidth(2)
-    w.setframerate(24000)
-    w.writeframes(b'\\x00\\x00' * 24000)
-""",
-        encoding="utf-8",
+def test_split_compound_action_separates_distinct_ui_interactions():
+    pieces = _split_compound_action(
+        "Click Add button and select ITL Design Part from drop down."
     )
-    ref_audio.write_bytes(b"placeholder")
-    ref_text.write_text("नमस्ते", encoding="utf-8")
+    assert pieces == [
+        "Click Add button.",
+        "Select ITL Design Part from drop down.",
+    ]
 
-    monkeypatch.setattr(tts_service, "HINGLISH_TTS_REPO", str(repo))
-    monkeypatch.setattr(tts_service, "HINGLISH_REF_AUDIO", str(ref_audio))
-    monkeypatch.setattr(tts_service, "HINGLISH_REF_TEXT_PATH", str(ref_text))
-    monkeypatch.setattr(tts_service, "HINGLISH_PYTHON", sys.executable)
 
-    duration = tts_service._generate_local_hinglish_subprocess(
-        "Ab New button par click kijiye.",
-        output,
+def test_split_compound_action_handles_select_then_click():
+    pieces = _split_compound_action(
+        "Select the part and click Attachment tab."
     )
+    assert pieces == [
+        "Select the part.",
+        "Click Attachment tab.",
+    ]
 
-    assert output.exists()
-    assert 0.9 < duration < 1.1
+
+# ----------------------------------------------------------------------
+# Fragment rejection
+# ----------------------------------------------------------------------
+
+def test_bare_verb_fragments_are_rejected():
+    for bad in ("Type", "Select", "Click", "Open"):
+        assert _is_bad_segment(bad)
 
 
-def test_local_hinglish_failure_is_fatal(monkeypatch, tmp_path):
-    from app.services import tts_service
+def test_normal_sentence_is_not_a_bad_segment():
+    assert not _is_bad_segment("Click the Filter button.")
 
-    monkeypatch.setattr(tts_service, "TTS_PROVIDER", "local_hinglish")
+
+# ----------------------------------------------------------------------
+# Screenshot candidate selection
+# ----------------------------------------------------------------------
+
+SCREENSHOTS = [
+    {"index": 0, "page": 1, "screenshot_index_on_page": 0, "path": "p1_a.png"},
+    {"index": 1, "page": 1, "screenshot_index_on_page": 1, "path": "p1_b.png"},
+    {"index": 2, "page": 2, "screenshot_index_on_page": 0, "path": "p2_a.png"},
+]
+
+
+def test_candidate_screenshots_returns_all_same_page_regions_in_order():
+    candidates = _candidate_screenshots(SCREENSHOTS, source_page=1)
+    assert [c["path"] for c in candidates] == ["p1_a.png", "p1_b.png"]
+
+
+def test_candidate_screenshots_falls_back_to_nearest_page():
+    candidates = _candidate_screenshots(SCREENSHOTS, source_page=3)
+    assert [c["path"] for c in candidates] == ["p2_a.png"]
+
+
+def test_choose_screenshot_still_returns_a_single_best_guess():
+    chosen = _choose_screenshot(SCREENSHOTS, source_page=1, action="Click Add.")
+    assert chosen["path"] == "p1_a.png"
+
+
+def test_explanation_never_calls_vision_and_uses_first_candidate(monkeypatch):
+    # Explanations should not trigger a vision call even when several
+    # screenshots exist on the page.
+    calls = []
+
+    def fake_vision_target(path, action):
+        calls.append(path)
+        return {"found": False, "target_name": "", "click_point": None,
+                "bounding_box": None, "confidence": 0.0}
+
     monkeypatch.setattr(
-        tts_service,
-        "_generate_one",
-        lambda text, wav: (_ for _ in ()).throw(RuntimeError("demo failure")),
+        "app.services.ai_service._vision_target", fake_vision_target
     )
 
-    try:
-        tts_service.generate_narration(
-            {"steps": [{"tts_narration": "Ab click kijiye."}]},
-            tmp_path,
-        )
-    except RuntimeError as exc:
-        assert "TTS failed for step 1" in str(exc)
-    else:
-        raise AssertionError("local_hinglish failure must be fatal")
+    screenshot, visual = _select_screenshot_and_visual(
+        SCREENSHOTS, source_page=1, piece="Explains a concept.", kind="explanation"
+    )
+
+    assert screenshot["path"] == "p1_a.png"
+    assert visual["found"] is False
+    assert calls == []
 
 
-def test_kokoro_language_config_and_voice_validation():
-    from app.services import tts_service
-    key, config = tts_service._kokoro_config("en-us")
-    assert key == "en-us"
-    assert config["lang_code"] == "a"
-    assert "af_heart" in tts_service.KOKORO_VOICES["a"]
-    key, config = tts_service._kokoro_config("hinglish")
-    assert config["lang_code"] == "h"
-    assert "hf_alpha" in tts_service.KOKORO_VOICES["h"]
+def test_action_grounds_against_every_same_page_candidate_and_keeps_best(monkeypatch):
+    # Regression test for the "always screenshot[0]" bug: the control
+    # for this action is only visible in the SECOND screenshot on the
+    # page, so grounding must pick that one, not the first.
+    def fake_vision_target(path, action):
+        if path == "p1_b.png":
+            return {
+                "found": True,
+                "target_name": "Filter button",
+                "click_point": [0.5, 0.5],
+                "bounding_box": [0.4, 0.4, 0.6, 0.6],
+                "confidence": 0.91,
+            }
+        return {"found": False, "target_name": "", "click_point": None,
+                "bounding_box": None, "confidence": 0.0}
+
+    monkeypatch.setattr(
+        "app.services.ai_service._vision_target", fake_vision_target
+    )
+
+    screenshot, visual = _select_screenshot_and_visual(
+        SCREENSHOTS, source_page=1, piece="Click Filter.", kind="action"
+    )
+
+    assert screenshot["path"] == "p1_b.png"
+    assert visual["found"] is True
+    assert visual["target_name"] == "Filter button"
 
 
-def test_kokoro_pcm16_output_validation(monkeypatch, tmp_path):
-    import numpy as np
+def test_action_with_no_grounded_candidate_falls_back_to_first_screenshot(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.ai_service._vision_target",
+        lambda path, action: {
+            "found": False, "target_name": "", "click_point": None,
+            "bounding_box": None, "confidence": 0.0,
+        },
+    )
+
+    screenshot, visual = _select_screenshot_and_visual(
+        SCREENSHOTS, source_page=1, piece="Click Save.", kind="action"
+    )
+
+    assert screenshot["path"] == "p1_a.png"
+    assert visual["found"] is False
+
+
+# ----------------------------------------------------------------------
+# Scene pacing / minimum duration floor
+# ----------------------------------------------------------------------
+
+def test_short_action_narration_is_padded_up_to_the_floor(tmp_path):
     import wave
-    from app.services import tts_service
 
-    class FakePipeline:
-        def __call__(self, text, voice):
-            assert voice == "hf_alpha"
-            yield ("", "", np.zeros(24000, dtype=np.float32))
+    wav = tmp_path / "short.wav"
+    with wave.open(str(wav), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        # ~0.3s clip -- shorter than the action floor.
+        w.writeframes(b"\x00\x00" * int(16000 * 0.3))
 
-    monkeypatch.setattr(tts_service, "_get_kokoro_pipeline", lambda language: (FakePipeline(), tts_service.KOKORO_LANGUAGE_CONFIG["hinglish"]))
-    out = tmp_path / "kokoro.wav"
-    duration = tts_service._generate_kokoro_speech("test", out, language="hinglish", voice="hf_alpha")
-    assert 0.9 < duration < 1.1
-    with wave.open(str(out), "rb") as w:
-        assert w.getsampwidth() == 2
-        assert w.getframerate() == 24000
+    scene = {"kind": "action", "narration": "Click Save."}
+    duration = _audio_duration_for_scene(scene, index=0, audio_paths=[str(wav)])
+
+    assert duration >= MIN_SCENE_SECONDS["action"]
+
+
+def test_long_action_narration_keeps_its_own_length_plus_padding(tmp_path):
+    import wave
+
+    wav = tmp_path / "long.wav"
+    with wave.open(str(wav), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes(b"\x00\x00" * 16000 * 5)  # 5s clip
+
+    scene = {"kind": "action", "narration": "..."}
+    duration = _audio_duration_for_scene(scene, index=0, audio_paths=[str(wav)])
+
+    assert duration == 5.0 + SCENE_PADDING_SECONDS

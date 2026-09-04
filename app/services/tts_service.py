@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
-TTS_PROVIDER = os.getenv("TTS_PROVIDER", "kokoro").strip().lower()
+TTS_PROVIDER = os.getenv("TTS_PROVIDER", "sapi").strip().lower()
 
 # English-only configuration.
 KOKORO_DEFAULT_LANGUAGE = "en-us"

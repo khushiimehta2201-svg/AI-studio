@@ -2,7 +2,7 @@ import json
 import os
 import re
 from difflib import SequenceMatcher
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -435,6 +435,13 @@ def _split_compound_action(
 
         if not piece.endswith("."):
             piece += "."
+
+        # Splitting a compound sentence leaves later pieces starting
+        # mid-sentence in lowercase (e.g. "select ITL Design Part...").
+        # Capitalize so each piece reads as its own sentence in
+        # captions/narration.
+        if piece and piece[0].islower():
+            piece = piece[0].upper() + piece[1:]
 
         result.append(piece)
 
@@ -944,47 +951,68 @@ def _normalise_screenshots(
     return result
 
 
+def _candidate_screenshots(
+    screenshots: List[Dict[str, Any]],
+    source_page: Optional[int],
+) -> List[Dict[str, Any]]:
+    """
+    All screenshots worth considering for a step, ordered by
+    relevance. Same-page screenshots first (in on-page order),
+    since a page can contain several distinct screenshot regions
+    for different steps.
+    """
+    if not screenshots:
+        return []
+
+    if source_page is not None:
+        same_page = [
+            item
+            for item in screenshots
+            if item.get("page") == source_page
+        ]
+
+        if same_page:
+            return sorted(
+                same_page,
+                key=lambda item: item.get(
+                    "screenshot_index_on_page", 0
+                ),
+            )
+
+        numbered = [
+            item
+            for item in screenshots
+            if isinstance(item.get("page"), int)
+        ]
+
+        if numbered:
+            nearest_page = min(
+                (item["page"] for item in numbered),
+                key=lambda page: abs(page - source_page),
+            )
+            return sorted(
+                (
+                    item
+                    for item in numbered
+                    if item["page"] == nearest_page
+                ),
+                key=lambda item: item.get(
+                    "screenshot_index_on_page", 0
+                ),
+            )
+
+    return [screenshots[0]]
+
+
 def _choose_screenshot(
     screenshots: List[Dict[str, Any]],
     source_page: Optional[int],
     action: str,
 ) -> Optional[Dict[str, Any]]:
-    if not screenshots:
-        return None
-
-    # Best case: same page.
-    if source_page is not None:
-        same_page = [
-            item
-            for item in screenshots
-            if item.get("page")
-            == source_page
-        ]
-
-        if same_page:
-            return same_page[0]
-
-    # Otherwise nearest screenshot page.
-    if source_page is not None:
-        candidates = [
-            item
-            for item in screenshots
-            if isinstance(
-                item.get("page"),
-                int,
-            )
-        ]
-
-        if candidates:
-            return min(
-                candidates,
-                key=lambda item: abs(
-                    item["page"]
-                    - source_page
-                ),
-            )
-
-    return screenshots[0]
+    candidates = _candidate_screenshots(
+        screenshots, source_page
+    )
+    return candidates[0] if candidates else None
 
 
 # ----------------------------------------------------------------------
@@ -1008,6 +1036,61 @@ def _target_query(
     return _clean_text(
         action
     )
+
+
+def _select_screenshot_and_visual(
+    screenshots: List[Dict[str, Any]],
+    source_page: Optional[int],
+    piece: str,
+    kind: str,
+) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Pick the right screenshot for a step. For actions on a page with
+    several candidate screenshots, ground the action against EACH
+    candidate and keep whichever one Qwen actually finds the control
+    in (highest confidence wins), instead of always reusing the first
+    screenshot on the page regardless of which region the action's
+    target is actually in.
+    """
+    empty_visual = {
+        "found": False,
+        "target_name": "",
+        "click_point": None,
+        "bounding_box": None,
+        "confidence": 0.0,
+    }
+
+    candidates = _candidate_screenshots(
+        screenshots, source_page
+    )
+
+    if not candidates:
+        return None, empty_visual
+
+    if kind != "action" or len(candidates) == 1:
+        chosen = candidates[0]
+        visual = (
+            _vision_target(chosen.get("path"), piece)
+            if kind == "action"
+            else empty_visual
+        )
+        return chosen, visual
+
+    best_screenshot = candidates[0]
+    best_visual = empty_visual
+
+    for candidate in candidates:
+        visual = _vision_target(
+            candidate.get("path"), piece
+        )
+
+        if visual["found"] and (
+            visual["confidence"] > best_visual["confidence"]
+        ):
+            best_screenshot = candidate
+            best_visual = visual
+
+    return best_screenshot, best_visual
 
 
 def _vision_target(
@@ -1469,13 +1552,19 @@ def build_tutorial_plan(
                 continue
 
             # --------------------------------------------------
-            # Screenshot
+            # Screenshot + visual grounding
+            #
+            # For actions, this tries every same-page screenshot
+            # candidate and keeps the one Qwen actually grounds the
+            # control in, instead of always reusing the first
+            # screenshot found on the page.
             # --------------------------------------------------
 
-            screenshot = _choose_screenshot(
+            screenshot, visual = _select_screenshot_and_visual(
                 screenshots,
                 source_page,
                 piece,
+                kind,
             )
 
             screenshot_path = (
@@ -1489,27 +1578,6 @@ def build_tutorial_plan(
                 if screenshot
                 else source_page
             )
-
-            # --------------------------------------------------
-            # Visual grounding
-            # --------------------------------------------------
-
-            visual = {
-                "found": False,
-                "target_name": "",
-                "click_point": None,
-                "bounding_box": None,
-                "confidence": 0.0,
-            }
-
-            if (
-                kind == "action"
-                and screenshot_path
-            ):
-                visual = _vision_target(
-                    screenshot_path,
-                    piece,
-                )
 
             # --------------------------------------------------
             # Narration
