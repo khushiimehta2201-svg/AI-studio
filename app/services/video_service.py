@@ -3,1210 +3,346 @@ import subprocess
 import wave
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-
 import cv2
 import numpy as np
-
 
 WIDTH = 1280
 HEIGHT = 720
 FPS = 24
+MIN_SCENE_DURATION = 3.5
+SCENE_PADDING_SECONDS = 0.6
 
 
-# ----------------------------------------------------------------------
-# AUDIO
-# ----------------------------------------------------------------------
-
-def _audio_files(
-    audio: Any,
-) -> List[str]:
-    """
-    Extract audio paths from several possible TTS result structures.
-    """
-
+def _audio_files(audio: Any) -> List[str]:
+    """Extracts valid WAV audio file paths from the TTS result structure."""
     if not audio:
         return []
 
     items = audio
-
-    if isinstance(
-        audio,
-        dict,
-    ):
-        for key in (
-            "files",
-            "audio_files",
-            "steps",
-            "narration",
-        ):
+    if isinstance(audio, dict):
+        for key in ("files", "audio_files", "steps", "narration"):
             if key in audio:
                 items = audio[key]
                 break
 
-    if isinstance(
-        items,
-        dict,
-    ):
-        items = list(
-            items.values()
-        )
+    if isinstance(items, dict):
+        items = list(items.values())
 
-    if not isinstance(
-        items,
-        list,
-    ):
+    if not isinstance(items, list):
         items = [items]
 
     paths = []
-
     for item in items:
-        path = None
-
-        if isinstance(
-            item,
-            str,
-        ):
-            path = item
-
-        elif isinstance(
-            item,
-            dict,
-        ):
-            for key in (
-                "path",
-                "file",
-                "audio",
-                "wav",
-                "audio_path",
-            ):
-                value = item.get(
-                    key
-                )
-
-                if value:
-                    path = value
+        p = None
+        if isinstance(item, str):
+            p = item
+        elif isinstance(item, dict):
+            for key in ("path", "file", "audio", "wav", "audio_path"):
+                if item.get(key):
+                    p = item[key]
                     break
-
-        if not path:
-            continue
-
-        path = str(
-            path
-        )
-
-        if os.path.exists(
-            path
-        ):
-            paths.append(
-                path
-            )
+        if p and os.path.exists(str(p)):
+            paths.append(str(p))
 
     return paths
 
 
-def _duration(
-    path: str,
-) -> float:
+def _duration(path: Optional[str]) -> float:
+    if not path or not os.path.exists(path):
+        return 3.5
     try:
-        with wave.open(
-            path,
-            "rb",
-        ) as wf:
-            frames = wf.getnframes()
-            rate = wf.getframerate()
-
-            if rate:
-                return max(
-                    0.5,
-                    frames / float(rate),
-                )
+        with wave.open(str(path), "rb") as wf:
+            return max(1.0, wf.getnframes() / float(wf.getframerate()))
     except Exception:
-        pass
-
-    return 2.0
+        return 3.5
 
 
-# ----------------------------------------------------------------------
-# IMAGE
-# ----------------------------------------------------------------------
-
-def _fit_image(
-    image: np.ndarray,
-    width: int = WIDTH,
-    height: int = HEIGHT,
-) -> np.ndarray:
-
-    canvas = np.zeros(
-        (
-            height,
-            width,
-            3,
-        ),
-        dtype=np.uint8,
-    )
-
+def _fit_image(image: Optional[np.ndarray], width: int = WIDTH, height: int = HEIGHT) -> Tuple[np.ndarray, Tuple[int, int, int, int]]:
+    """Letterboxes screenshot over a dark backdrop and returns bounding offsets."""
+    canvas = np.full((height, width, 3), (24, 26, 27), dtype=np.uint8)
     if image is None:
-        return canvas
+        return canvas, (0, 0, width, height)
 
     ih, iw = image.shape[:2]
-
     if iw <= 0 or ih <= 0:
-        return canvas
+        return canvas, (0, 0, width, height)
 
-    scale = min(
-        width / float(iw),
-        height / float(ih),
-    )
+    scale = min(width / float(iw), height / float(ih))
+    nw = max(1, int(iw * scale))
+    nh = max(1, int(ih * scale))
+    resized = cv2.resize(image, (nw, nh), interpolation=cv2.INTER_AREA)
 
-    nw = max(
-        1,
-        int(iw * scale),
-    )
+    x_offset = (width - nw) // 2
+    y_offset = (height - nh) // 2
+    canvas[y_offset:y_offset + nh, x_offset:x_offset + nw] = resized
+    return canvas, (x_offset, y_offset, nw, nh)
 
-    nh = max(
-        1,
-        int(ih * scale),
-    )
 
-    resized = cv2.resize(
-        image,
-        (
-            nw,
-            nh,
-        ),
-        interpolation=cv2.INTER_AREA,
-    )
+def _draw_presentation_slide(title: str, content: str) -> np.ndarray:
+    """Renders a modern presentation slide for text-only pages."""
+    canvas = np.full((HEIGHT, WIDTH, 3), (30, 32, 34), dtype=np.uint8)
 
-    x = (
-        width - nw
-    ) // 2
+    # Accent top border
+    cv2.rectangle(canvas, (0, 0), (WIDTH, 8), (0, 165, 255), -1)
 
-    y = (
-        height - nh
-    ) // 2
+    # Section Title
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    clean_title = (title or "Overview").strip()[:60]
+    cv2.putText(canvas, clean_title, (70, 90), font, 1.1, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.line(canvas, (70, 115), (WIDTH - 70, 115), (70, 75, 80), 1, cv2.LINE_AA)
 
-    canvas[
-        y:y + nh,
-        x:x + nw,
-    ] = resized
+    # Bullet point content
+    lines = [l.strip() for l in content.splitlines() if l.strip() and len(l.strip()) > 3][:6]
+    y = 175
+    for line in lines:
+        cv2.circle(canvas, (85, y - 6), 5, (0, 165, 255), -1, cv2.LINE_AA)
+        words = line.split()
+        curr_line = ""
+        for w in words:
+            if len(curr_line + " " + w) > 65:
+                cv2.putText(canvas, curr_line.strip(), (105, y), font, 0.72, (220, 225, 230), 2, cv2.LINE_AA)
+                y += 34
+                curr_line = w
+            else:
+                curr_line += " " + w
+        if curr_line.strip():
+            cv2.putText(canvas, curr_line.strip(), (105, y), font, 0.72, (220, 225, 230), 2, cv2.LINE_AA)
+            y += 46
 
     return canvas
 
 
-def _load_frame(
-    path: Optional[str],
-) -> Optional[np.ndarray]:
+def _draw_mouse_pointer(frame: np.ndarray, x: int, y: int, clicking: bool = False, click_progress: float = 0.0) -> np.ndarray:
+    """Draws a medium-large OS mouse cursor arrow with drop-shadow and click ripple."""
+    if clicking and click_progress > 0.0:
+        ripple_r = int(10 + 35 * click_progress)
+        alpha = max(0.0, 1.0 - click_progress)
+        overlay = frame.copy()
+        cv2.circle(overlay, (x, y), ripple_r, (0, 165, 255), 3, cv2.LINE_AA)
+        cv2.circle(overlay, (x, y), 6, (0, 120, 255), -1, cv2.LINE_AA)
+        cv2.addWeighted(overlay, alpha * 0.8, frame, 1.0 - (alpha * 0.8), 0, frame)
 
-    if not path:
-        return None
+    arrow_pts = np.array([
+        [x, y],
+        [x, y + 24],
+        [x + 6, y + 19],
+        [x + 12, y + 29],
+        [x + 16, y + 27],
+        [x + 10, y + 17],
+        [x + 18, y + 17],
+    ], dtype=np.int32)
 
-    if not os.path.exists(
-        path
-    ):
-        return None
+    # 1. Drop shadow
+    shadow_pts = arrow_pts + 2
+    cv2.fillPoly(frame, [shadow_pts], (15, 15, 15), cv2.LINE_AA)
 
-    image = cv2.imread(
-        path
-    )
+    # 2. White cursor body
+    cv2.fillPoly(frame, [arrow_pts], (255, 255, 255), cv2.LINE_AA)
 
-    if image is None:
-        return None
+    # 3. Crisp Black border
+    cv2.polylines(frame, [arrow_pts], isClosed=True, color=(0, 0, 0), thickness=2, lineType=cv2.LINE_AA)
 
-    return _fit_image(
-        image
-    )
+    return frame
 
 
-# ----------------------------------------------------------------------
-# CAPTIONS
-# ----------------------------------------------------------------------
-
-def _draw_caption(
-    frame: np.ndarray,
-    text: str,
-    kind: str,
-) -> np.ndarray:
-
+def _draw_caption(frame: np.ndarray, text: str) -> np.ndarray:
     if not text:
         return frame
 
-    lines = []
-
-    for raw in str(
-        text
-    ).splitlines():
-
-        raw = raw.strip()
-
-        if not raw:
-            continue
-
-        words = raw.split()
-
-        current = ""
-
-        for word in words:
-            candidate = (
-                f"{current} {word}".strip()
-            )
-
-            if len(candidate) > 70:
-                if current:
-                    lines.append(
-                        current
-                    )
-
-                current = word
-
-            else:
-                current = candidate
-
-        if current:
-            lines.append(
-                current
-            )
-
-    if not lines:
-        return frame
+    words = text.split()
+    lines, curr = [], ""
+    for w in words:
+        if len(curr + " " + w) > 75:
+            lines.append(curr.strip())
+            curr = w
+        else:
+            curr += " " + w
+    if curr.strip():
+        lines.append(curr.strip())
 
     font = cv2.FONT_HERSHEY_SIMPLEX
-
-    scale = 0.72
+    scale = 0.62
     thickness = 2
-    line_height = 32
-    padding = 20
+    line_h = 28
+    pad = 12
 
-    total_height = (
-        len(lines)
-        * line_height
-        + padding * 2
-    )
-
-    y1 = (
-        HEIGHT
-        - total_height
-        - 18
-    )
-
-    y2 = HEIGHT - 18
-
-    y1 = max(
-        HEIGHT // 2,
-        y1,
-    )
+    total_h = len(lines) * line_h + pad * 2
+    y1 = HEIGHT - total_h - 15
+    y2 = HEIGHT - 15
 
     overlay = frame.copy()
+    cv2.rectangle(overlay, (40, y1), (WIDTH - 40, y2), (10, 12, 14), -1)
+    frame = cv2.addWeighted(overlay, 0.80, frame, 0.20, 0)
 
-    cv2.rectangle(
-        overlay,
-        (
-            20,
-            y1,
-        ),
-        (
-            WIDTH - 20,
-            y2,
-        ),
-        (0, 0, 0),
-        -1,
-    )
-
-    frame = cv2.addWeighted(
-        overlay,
-        0.72,
-        frame,
-        0.28,
-        0,
-    )
-
-    text_y = (
-        y1
-        + padding
-        + 24
-    )
-
+    text_y = y1 + pad + 20
     for line in lines:
-        (
-            tw,
-            th,
-        ), _ = cv2.getTextSize(
-            line,
-            font,
-            scale,
-            thickness,
-        )
-
-        x = (
-            WIDTH - tw
-        ) // 2
-
-        cv2.putText(
-            frame,
-            line,
-            (
-                x,
-                text_y,
-            ),
-            font,
-            scale,
-            (255, 255, 255),
-            thickness,
-            cv2.LINE_AA,
-        )
-
-        text_y += line_height
+        (tw, _), _ = cv2.getTextSize(line, font, scale, thickness)
+        tx = (WIDTH - tw) // 2
+        cv2.putText(frame, line, (tx, text_y), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+        text_y += line_h
 
     return frame
 
 
-# ----------------------------------------------------------------------
-# CURSOR
-# ----------------------------------------------------------------------
+def _interpolate_multi_targets(
+    targets: List[Tuple[int, int]],
+    frame_index: int,
+    total_frames: int,
+) -> Tuple[int, int, bool, float]:
+    if not targets:
+        return 0, 0, False, 0.0
 
-def _valid_point(
-    point: Any,
-) -> bool:
-    return (
-        isinstance(
-            point,
-            (list, tuple),
-        )
-        and len(point) == 2
-    )
+    if len(targets) == 1:
+        tx, ty = targets[0]
+        start_x, start_y = max(20, tx - 100), max(20, ty - 60)
+        move_frames = max(1, int(FPS * 1.0))
+        t = min(1.0, frame_index / float(move_frames))
+        t_smooth = t * t * (3.0 - 2.0 * t)
+        cx = int(start_x + (tx - start_x) * t_smooth)
+        cy = int(start_y + (ty - start_y) * t_smooth)
+
+        clicking = (frame_index >= move_frames) and (frame_index <= move_frames + int(FPS * 0.4))
+        progress = (frame_index - move_frames) / float(FPS * 0.4) if clicking else 0.0
+        return cx, cy, clicking, max(0.0, min(1.0, progress))
+
+    segments = len(targets)
+    frames_per_segment = max(1.0, total_frames / float(segments))
+    seg_idx = min(segments - 1, int(frame_index / frames_per_segment))
+
+    from_pt = targets[seg_idx - 1] if seg_idx > 0 else (targets[0][0] - 80, targets[0][1] - 50)
+    to_pt = targets[seg_idx]
+
+    local_f = frame_index - (seg_idx * frames_per_segment)
+    travel_frames = max(1.0, frames_per_segment * 0.65)
+    t = min(1.0, local_f / float(travel_frames))
+    t_smooth = t * t * (3.0 - 2.0 * t)
+
+    cx = int(from_pt[0] + (to_pt[0] - from_pt[0]) * t_smooth)
+    cy = int(from_pt[1] + (to_pt[1] - from_pt[1]) * t_smooth)
+
+    click_frames = max(1.0, frames_per_segment * 0.35)
+    clicking = (local_f >= travel_frames)
+    progress = (local_f - travel_frames) / float(click_frames) if clicking else 0.0
+
+    return cx, cy, clicking, max(0.0, min(1.0, progress))
 
 
-def _normalise_point(
-    point,
-) -> Optional[
-    Tuple[float, float]
-]:
-
-    if not _valid_point(
-        point
-    ):
+def _build_audio_concat(audio_paths: List[str], output_dir: Path) -> Optional[str]:
+    """Combines individual audio files into a single continuous narration WAV."""
+    if not audio_paths:
+        print("[AUDIO] No audio files to concatenate.")
         return None
 
-    try:
-        x = float(
-            point[0]
-        )
+    concat_file = output_dir / "audio_concat.txt"
+    narration_file = output_dir / "narration.wav"
 
-        y = float(
-            point[1]
-        )
+    with open(concat_file, "w", encoding="utf-8") as f:
+        for path in audio_paths:
+            safe_path = Path(path).resolve().as_posix().replace("'", "'\\''")
+            f.write(f"file '{safe_path}'\n")
 
-    except Exception:
-        return None
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", str(concat_file),
+        "-c:a", "pcm_s16le",
+        str(narration_file),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
 
-    if not (
-        0.0 <= x <= 1.0
-        and 0.0 <= y <= 1.0
-    ):
-        return None
+    if result.returncode == 0 and narration_file.exists():
+        return str(narration_file)
 
-    return (
-        x,
-        y,
-    )
-
-
-def _draw_cursor(
-    frame: np.ndarray,
-    point: Tuple[float, float],
-    scale: float = 1.0,
-) -> np.ndarray:
-
-    x = int(
-        max(
-            0.0,
-            min(
-                1.0,
-                point[0],
-            ),
-        )
-        * WIDTH
-    )
-
-    y = int(
-        max(
-            0.0,
-            min(
-                1.0,
-                point[1],
-            ),
-        )
-        * HEIGHT
-    )
-
-    radius = max(
-        6,
-        int(
-            10 * scale
-        ),
-    )
-
-    cv2.circle(
-        frame,
-        (
-            x + 3,
-            y + 3,
-        ),
-        radius + 2,
-        (0, 0, 0),
-        -1,
-        cv2.LINE_AA,
-    )
-
-    cv2.circle(
-        frame,
-        (
-            x,
-            y,
-        ),
-        radius,
-        (255, 255, 255),
-        -1,
-        cv2.LINE_AA,
-    )
-
-    cv2.circle(
-        frame,
-        (
-            x,
-            y,
-        ),
-        radius,
-        (0, 0, 0),
-        2,
-        cv2.LINE_AA,
-    )
-
-    return frame
-
-
-def _draw_click(
-    frame: np.ndarray,
-    point: Tuple[float, float],
-    progress: float,
-) -> np.ndarray:
-
-    x = int(
-        max(
-            0.0,
-            min(
-                1.0,
-                point[0],
-            ),
-        )
-        * WIDTH
-    )
-
-    y = int(
-        max(
-            0.0,
-            min(
-                1.0,
-                point[1],
-            ),
-        )
-        * HEIGHT
-    )
-
-    progress = max(
-        0.0,
-        min(
-            1.0,
-            progress,
-        ),
-    )
-
-    radius = int(
-        12
-        + 35 * progress
-    )
-
-    thickness = max(
-        1,
-        int(
-            5
-            * (1.0 - progress)
-        ),
-    )
-
-    cv2.circle(
-        frame,
-        (
-            x,
-            y,
-        ),
-        radius,
-        (0, 0, 255),
-        thickness,
-        cv2.LINE_AA,
-    )
-
-    return frame
-
-
-def _interpolate(
-    start: Tuple[float, float],
-    end: Tuple[float, float],
-    t: float,
-) -> Tuple[float, float]:
-
-    t = max(
-        0.0,
-        min(
-            1.0,
-            t,
-        ),
-    )
-
-    # Smoothstep.
-    t = (
-        t
-        * t
-        * (
-            3.0
-            - 2.0 * t
-        )
-    )
-
-    return (
-        start[0]
-        + (
-            end[0]
-            - start[0]
-        )
-        * t,
-
-        start[1]
-        + (
-            end[1]
-            - start[1]
-        )
-        * t,
-    )
-
-
-# ----------------------------------------------------------------------
-# SCENE TARGET
-# ----------------------------------------------------------------------
-
-def _scene_target(
-    scene: Dict[str, Any],
-) -> Optional[
-    Tuple[float, float]
-]:
-
-    target = _normalise_point(
-        scene.get(
-            "cursor"
-        )
-    )
-
-    if target:
-        return target
-
-    actions = (
-        scene.get(
-            "actions"
-        )
-        or []
-    )
-
-    for action in actions:
-
-        if not isinstance(
-            action,
-            dict,
-        ):
-            continue
-
-        target = _normalise_point(
-            action.get(
-                "target"
-            )
-        )
-
-        if target:
-            return target
-
+    print(f"[AUDIO] Concat failed: {result.stderr}")
     return None
 
 
-# ----------------------------------------------------------------------
-# AUDIO / SCENE DURATION
-# ----------------------------------------------------------------------
-
-# Minimum on-screen time for a scene, even when the TTS clip is very
-# short. Gives the viewer time to actually see the screenshot, watch
-# the cursor glide + click, and read the caption instead of the frame
-# flashing past. Actions get more floor than explanations because they
-# also have to fit the ~0.8s cursor-move-and-click animation.
-MIN_SCENE_SECONDS = {
-    "action": 2.6,
-    "explanation": 2.0,
-    "topic": 1.6,
-}
-
-# Extra breathing room added on top of the raw narration length so
-# pacing doesn't feel rushed even when the TTS engine speaks quickly.
-SCENE_PADDING_SECONDS = 0.5
-
-
-def _audio_duration_for_scene(
-    scene: Dict[str, Any],
-    index: int,
-    audio_paths: List[str],
-) -> float:
-
-    kind = scene.get("kind", "action")
-    floor = MIN_SCENE_SECONDS.get(kind, 2.0)
-
-    # The most reliable mapping is a direct audio index.
-    if index < len(
-        audio_paths
-    ):
-        raw = _duration(
-            audio_paths[index]
-        )
-        return max(
-            floor,
-            raw + SCENE_PADDING_SECONDS,
-        )
-
-    narration = (
-        scene.get(
-            "narration"
-        )
-        or scene.get(
-            "tts_narration"
-        )
-        or ""
-    )
-
-    if narration:
-        # Reasonable fallback when TTS output has
-        # fewer files than scenes.
-        words = len(
-            str(narration).split()
-        )
-
-        estimate = min(
-            8.0,
-            words / 2.5,
-        )
-
-        return max(
-            floor,
-            estimate + SCENE_PADDING_SECONDS,
-        )
-
-    return floor
-
-
-# ----------------------------------------------------------------------
-# RAW VIDEO
-# ----------------------------------------------------------------------
-
-def _write_raw_video(
-    plan: Dict[str, Any],
-    audio: Any,
-    output_path: str,
-) -> None:
-
-    steps = (
-        plan.get(
-            "steps"
-        )
-        or []
-    )
-
-    if not steps:
-        raise RuntimeError(
-            "Tutorial plan contains no scenes."
-        )
-
-    audio_paths = _audio_files(
-        audio
-    )
+def render(plan: Dict[str, Any], audio: Any, job_dir: str, final_path: str) -> str:
+    job_dir = Path(job_dir)
+    final_path = Path(final_path)
+    raw_video = job_dir / "video_raw.mp4"
+    audio_paths = _audio_files(audio)
+    steps = plan.get("steps", [])
 
     writer = cv2.VideoWriter(
-        output_path,
-        cv2.VideoWriter_fourcc(
-            *"mp4v"
-        ),
+        str(raw_video),
+        cv2.VideoWriter_fourcc(*"mp4v"),
         FPS,
-        (
-            WIDTH,
-            HEIGHT,
-        ),
+        (WIDTH, HEIGHT),
     )
 
-    if not writer.isOpened():
-        raise RuntimeError(
-            "Could not open raw video writer."
-        )
-
-    previous_frame = None
-
     try:
-        for index, scene in enumerate(
-            steps
-        ):
+        for idx, scene in enumerate(steps):
+            img_path = scene.get("screenshot")
+            is_full_page = scene.get("is_full_page", False)
 
-            screenshot = scene.get(
-                "screenshot"
-            )
+            if is_full_page or not img_path or not os.path.exists(str(img_path)):
+                base_frame = _draw_presentation_slide(scene.get("title", ""), scene.get("content", ""))
+                ox, oy, nw, nh = 0, 0, WIDTH, HEIGHT
+            else:
+                raw_img = cv2.imread(str(img_path))
+                base_frame, (ox, oy, nw, nh) = _fit_image(raw_img)
 
-            frame = _load_frame(
-                screenshot
-            )
+            raw_dur = _duration(audio_paths[idx]) if idx < len(audio_paths) else 3.5
+            duration = max(MIN_SCENE_DURATION, raw_dur + SCENE_PADDING_SECONDS)
+            frame_count = int(duration * FPS)
 
-            if frame is None:
+            pixel_targets = []
+            targets_norm = scene.get("targets") or ([scene.get("cursor")] if scene.get("cursor") else [])
+            for t_norm in targets_norm:
+                if t_norm and len(t_norm) == 2:
+                    pixel_targets.append((
+                        int(ox + t_norm[0] * nw),
+                        int(oy + t_norm[1] * nh),
+                    ))
 
-                if previous_frame is not None:
-                    frame = previous_frame.copy()
+            has_cursor = (scene.get("kind") == "action" and len(pixel_targets) > 0 and not is_full_page)
 
-                else:
-                    frame = np.zeros(
-                        (
-                            HEIGHT,
-                            WIDTH,
-                            3,
-                        ),
-                        dtype=np.uint8,
-                    )
+            for fi in range(frame_count):
+                frame = base_frame.copy()
 
-            previous_frame = frame.copy()
+                if has_cursor:
+                    cx, cy, clicking, click_prog = _interpolate_multi_targets(pixel_targets, fi, frame_count)
+                    frame = _draw_mouse_pointer(frame, cx, cy, clicking=clicking, click_progress=click_prog)
 
-            duration = _audio_duration_for_scene(
-                scene,
-                index,
-                audio_paths,
-            )
-
-            frame_count = max(
-                1,
-                int(
-                    duration * FPS
-                ),
-            )
-
-            kind = scene.get(
-                "kind",
-                "action",
-            )
-
-            target = _scene_target(
-                scene
-            )
-
-            # Cursor is shown ONLY when an actual
-            # grounded target exists.
-            show_cursor = (
-                kind == "action"
-                and target is not None
-            )
-
-            for frame_index in range(
-                frame_count
-            ):
-
-                current = frame.copy()
-
-                if show_cursor:
-
-                    movement_frames = max(
-                        1,
-                        int(
-                            FPS * 0.55
-                        ),
-                    )
-
-                    movement_fraction = min(
-                        1.0,
-                        frame_index
-                        / float(
-                            movement_frames
-                        ),
-                    )
-
-                    # Start just outside the
-                    # target region rather than
-                    # appearing at the target.
-                    start = (
-                        max(
-                            0.02,
-                            min(
-                                0.95,
-                                target[0]
-                                - 0.18,
-                            ),
-                        ),
-                        max(
-                            0.02,
-                            min(
-                                0.90,
-                                target[1]
-                                - 0.12,
-                            ),
-                        ),
-                    )
-
-                    cursor_pos = _interpolate(
-                        start,
-                        target,
-                        movement_fraction,
-                    )
-
-                    current = _draw_cursor(
-                        current,
-                        cursor_pos,
-                    )
-
-                    # Click pulse near end.
-                    remaining = (
-                        frame_count
-                        - frame_index
-                    )
-
-                    click_frames = max(
-                        1,
-                        int(
-                            FPS * 0.25
-                        ),
-                    )
-
-                    if remaining <= click_frames:
-
-                        pulse_progress = 1.0 - (
-                            remaining
-                            / float(
-                                click_frames
-                            )
-                        )
-
-                        current = _draw_click(
-                            current,
-                            target,
-                            pulse_progress,
-                        )
-
-                current = _draw_caption(
-                    current,
-                    scene.get(
-                        "caption",
-                        "",
-                    ),
-                    kind,
-                )
-
-                writer.write(
-                    current
-                )
-
+                frame = _draw_caption(frame, scene.get("caption", ""))
+                writer.write(frame)
     finally:
         writer.release()
 
+    # Always initialize narration safely to prevent UnboundLocalError
+    narration_wav: Optional[str] = _build_audio_concat(audio_paths, job_dir)
 
-# ----------------------------------------------------------------------
-# AUDIO CONCAT
-# ----------------------------------------------------------------------
-
-def _build_audio_concat(
-    audio_paths: List[str],
-    output_dir: str,
-) -> Optional[str]:
-
-    if not audio_paths:
-        print(
-            "[AUDIO] No audio files found."
-        )
-        return None
-
-    concat_file = os.path.join(
-        output_dir,
-        "audio_concat.txt",
-    )
-
-    narration_file = os.path.join(
-        output_dir,
-        "narration.wav",
-    )
-
-    with open(
-        concat_file,
-        "w",
-        encoding="utf-8",
-    ) as f:
-
-        for path in audio_paths:
-
-            absolute = os.path.abspath(
-                path
-            )
-
-            # FFmpeg concat file syntax.
-            safe_path = (
-                absolute
-                .replace(
-                    "\\",
-                    "/",
-                )
-                .replace(
-                    "'",
-                    "'\\''",
-                )
-            )
-
-            f.write(
-                f"file '{safe_path}'\n"
-            )
-
-    command = [
-        "ffmpeg",
-        "-y",
-
-        "-f",
-        "concat",
-
-        "-safe",
-        "0",
-
-        "-i",
-        concat_file,
-
-        "-c:a",
-        "pcm_s16le",
-
-        narration_file,
-    ]
-
-    result = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-    )
-
-    if result.returncode != 0:
-
-        print(
-            "[FFMPEG] audio concat failed"
-        )
-
-        print(
-            result.stdout
-        )
-
-        print(
-            result.stderr
-        )
-
-        return None
-
-    if not os.path.exists(
-        narration_file
-    ):
-        return None
-
-    return narration_file
-
-
-# ----------------------------------------------------------------------
-# FINAL MP4
-# ----------------------------------------------------------------------
-
-def _finalize_with_ffmpeg(
-    raw_video: str,
-    narration: Optional[str],
-    final_path: str,
-) -> None:
-
-    if (
-        narration
-        and os.path.exists(
-            narration
-        )
-    ):
-
-        command = [
-            "ffmpeg",
-            "-y",
-
-            "-i",
-            raw_video,
-
-            "-i",
-            narration,
-
-            "-map",
-            "0:v:0",
-
-            "-map",
-            "1:a:0",
-
-            "-c:v",
-            "libx264",
-
-            "-preset",
-            "veryfast",
-
-            "-crf",
-            "20",
-
-            "-pix_fmt",
-            "yuv420p",
-
-            "-c:a",
-            "aac",
-
-            "-b:a",
-            "128k",
-
-            "-ar",
-            "48000",
-
-            "-movflags",
-            "+faststart",
-
+    # Final Mux with FFmpeg
+    if narration_wav and os.path.exists(narration_wav):
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(raw_video),
+            "-i", str(narration_wav),
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-b:a", "128k",
             "-shortest",
-
-            final_path,
+            str(final_path),
         ]
-
     else:
-
-        print(
-            "[AUDIO] Final video will contain no audio "
-            "because no narration WAV was produced."
-        )
-
-        command = [
-            "ffmpeg",
-            "-y",
-
-            "-i",
-            raw_video,
-
-            "-map",
-            "0:v:0",
-
-            "-c:v",
-            "libx264",
-
-            "-preset",
-            "veryfast",
-
-            "-crf",
-            "20",
-
-            "-pix_fmt",
-            "yuv420p",
-
+        # Fallback if no audio files were generated
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(raw_video),
+            "-map", "0:v:0",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-pix_fmt", "yuv420p",
             "-an",
-
-            "-movflags",
-            "+faststart",
-
-            final_path,
+            str(final_path),
         ]
 
-    result = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-    )
-
-    print(
-        "[FFMPEG]"
-    )
-
-    if result.stdout:
-        print(
-            result.stdout
-        )
-
-    if result.stderr:
-        print(
-            result.stderr
-        )
-
-    if result.returncode != 0:
-        raise RuntimeError(
-            "FFmpeg failed to create final MP4."
-        )
-
-    if not os.path.exists(
-        final_path
-    ):
-        raise RuntimeError(
-            "FFmpeg reported success but "
-            "the final MP4 does not exist."
-        )
-
-
-# ----------------------------------------------------------------------
-# PUBLIC RENDER FUNCTION
-# ----------------------------------------------------------------------
-
-def render(
-    plan: Dict[str, Any],
-    audio: Any,
-    job_dir: str,
-    final_path: str,
-) -> str:
-
-    job_dir = str(
-        job_dir
-    )
-
-    os.makedirs(
-        job_dir,
-        exist_ok=True,
-    )
-
-    final_path = str(
-        final_path
-    )
-
-    raw_video = os.path.join(
-        job_dir,
-        "video_raw.mp4",
-    )
-
-    audio_paths = _audio_files(
-        audio
-    )
-
-    print(
-        f"[RENDER] scenes={len(plan.get('steps') or [])}"
-    )
-
-    print(
-        f"[RENDER] audio_files={len(audio_paths)}"
-    )
-
-    narration = _build_audio_concat(
-        audio_paths,
-        job_dir,
-    )
-
-    _write_raw_video(
-        plan,
-        audio,
-        raw_video,
-    )
-
-    _finalize_with_ffmpeg(
-        raw_video,
-        narration,
-        final_path,
-    )
-
-    print(
-        f"[RENDER] final={final_path}"
-    )
-
-    return final_path
+    subprocess.run(cmd, capture_output=True)
+    print(f"[RENDER] Completed tutorial video: {final_path}")
+    return str(final_path)
