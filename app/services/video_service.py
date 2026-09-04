@@ -1,268 +1,1192 @@
-from pathlib import Path
-import math
+import os
 import subprocess
 import wave
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
-from PIL import Image, ImageDraw, ImageFont
-import imageio_ffmpeg
-
-FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
-W, H, FPS = 1280, 720, 24
-
-
-def wav_duration(path):
-    try:
-        with wave.open(str(path), "rb") as w:
-            return w.getnframes() / max(1, w.getframerate())
-    except Exception:
-        return 0.0
+import cv2
+import numpy as np
 
 
-def create_silent_wav(path, duration):
-    rate = 16000
-    frames = int(max(0.1, float(duration)) * rate)
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with wave.open(str(path), "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(rate)
-        w.writeframes(b"\0\0" * frames)
+WIDTH = 1280
+HEIGHT = 720
+FPS = 24
 
 
-def fit_image(image):
-    image = image.convert("RGB")
-    iw, ih = image.size
-    scale = min(W / max(1, iw), H / max(1, ih))
-    nw = max(1, int(iw * scale))
-    nh = max(1, int(ih * scale))
-    resized = image.resize((nw, nh), Image.Resampling.LANCZOS)
-    canvas = Image.new("RGB", (W, H), (245, 245, 245))
-    ox, oy = (W - nw) // 2, (H - nh) // 2
-    canvas.paste(resized, (ox, oy))
-    return canvas, ox, oy, scale
+# ----------------------------------------------------------------------
+# AUDIO
+# ----------------------------------------------------------------------
 
+def _audio_files(
+    audio: Any,
+) -> List[str]:
+    """
+    Extract audio paths from several possible TTS result structures.
+    """
 
-def cursor_path(a, b, n):
-    if not b:
+    if not audio:
         return []
-    if n <= 1:
-        return [b]
-    sx, sy = a
-    tx, ty = b
-    dx, dy = tx - sx, ty - sy
-    length = max(1e-6, math.hypot(dx, dy))
-    nx, ny = -dy / length, dx / length
-    bow = min(55, length * 0.12)
-    cx, cy = (sx + tx) / 2 + nx * bow, (sy + ty) / 2 + ny * bow
-    out = []
-    for i in range(n):
-        u = i / max(1, n - 1)
-        e = u * u * (3 - 2 * u)
-        a = (1 - e) * (1 - e)
-        b1 = 2 * (1 - e) * e
-        c = e * e
-        out.append((a * sx + b1 * cx + c * tx, a * sy + b1 * cy + c * ty))
-    return out
+
+    items = audio
+
+    if isinstance(
+        audio,
+        dict,
+    ):
+        for key in (
+            "files",
+            "audio_files",
+            "steps",
+            "narration",
+        ):
+            if key in audio:
+                items = audio[key]
+                break
+
+    if isinstance(
+        items,
+        dict,
+    ):
+        items = list(
+            items.values()
+        )
+
+    if not isinstance(
+        items,
+        list,
+    ):
+        items = [items]
+
+    paths = []
+
+    for item in items:
+        path = None
+
+        if isinstance(
+            item,
+            str,
+        ):
+            path = item
+
+        elif isinstance(
+            item,
+            dict,
+        ):
+            for key in (
+                "path",
+                "file",
+                "audio",
+                "wav",
+                "audio_path",
+            ):
+                value = item.get(
+                    key
+                )
+
+                if value:
+                    path = value
+                    break
+
+        if not path:
+            continue
+
+        path = str(
+            path
+        )
+
+        if os.path.exists(
+            path
+        ):
+            paths.append(
+                path
+            )
+
+    return paths
 
 
-def draw_caption(img, text):
-    words = str(text or "").split()
-    lines, cur = [], ""
-    for word in words:
-        candidate = (cur + " " + word).strip()
-        if cur and len(candidate) > 78:
-            lines.append(cur)
-            cur = word
-        else:
-            cur = candidate
-    if cur:
-        lines.append(cur)
-    lines = lines[:3]
-    d = ImageDraw.Draw(img)
+def _duration(
+    path: str,
+) -> float:
     try:
-        font = ImageFont.truetype("arial.ttf", 25)
+        with wave.open(
+            path,
+            "rb",
+        ) as wf:
+            frames = wf.getnframes()
+            rate = wf.getframerate()
+
+            if rate:
+                return max(
+                    0.5,
+                    frames / float(rate),
+                )
     except Exception:
-        font = ImageFont.load_default()
-    widths, heights = [], []
-    for line in lines:
-        box = d.textbbox((0, 0), line, font=font)
-        widths.append(box[2] - box[0])
-        heights.append(box[3] - box[1])
-    if not widths:
-        return
-    bw = min(W - 60, max(widths) + 44)
-    lh = max(heights) + 8
-    bh = lh * len(lines) + 24
-    x = (W - bw) // 2
-    y = H - bh - 18
-    d.rounded_rectangle((x, y, x + bw, y + bh), radius=12, fill=(0, 0, 0), outline=(255, 255, 255), width=1)
-    yy = y + 12
-    for line, height in zip(lines, heights):
-        box = d.textbbox((0, 0), line, font=font)
-        d.text(((W - (box[2] - box[0])) // 2, yy), line, fill=(255, 255, 255), font=font)
-        yy += lh
+        pass
+
+    return 2.0
 
 
-def draw_cursor(img, x, y, click=False):
-    d = ImageDraw.Draw(img)
-    x = int(max(8, min(W - 28, x)))
-    y = int(max(8, min(H - 34, y)))
-    p = [(x, y), (x, y + 24), (x + 7, y + 18), (x + 14, y + 30), (x + 19, y + 27), (x + 12, y + 16), (x + 22, y + 16)]
-    shadow = [(a + 3, b + 3) for a, b in p]
-    d.polygon(shadow, fill=(60, 60, 60))
-    d.polygon(p, fill=(255, 255, 255), outline=(0, 0, 0))
-    if click:
-        for r in (15, 23):
-            d.ellipse((x - r, y - r, x + r, y + r), outline=(255, 115, 35), width=3)
+# ----------------------------------------------------------------------
+# IMAGE
+# ----------------------------------------------------------------------
+
+def _fit_image(
+    image: np.ndarray,
+    width: int = WIDTH,
+    height: int = HEIGHT,
+) -> np.ndarray:
+
+    canvas = np.zeros(
+        (
+            height,
+            width,
+            3,
+        ),
+        dtype=np.uint8,
+    )
+
+    if image is None:
+        return canvas
+
+    ih, iw = image.shape[:2]
+
+    if iw <= 0 or ih <= 0:
+        return canvas
+
+    scale = min(
+        width / float(iw),
+        height / float(ih),
+    )
+
+    nw = max(
+        1,
+        int(iw * scale),
+    )
+
+    nh = max(
+        1,
+        int(ih * scale),
+    )
+
+    resized = cv2.resize(
+        image,
+        (
+            nw,
+            nh,
+        ),
+        interpolation=cv2.INTER_AREA,
+    )
+
+    x = (
+        width - nw
+    ) // 2
+
+    y = (
+        height - nh
+    ) // 2
+
+    canvas[
+        y:y + nh,
+        x:x + nw,
+    ] = resized
+
+    return canvas
 
 
-def draw_target(img, x, y, click=False):
-    d = ImageDraw.Draw(img)
-    r = 28
-    d.ellipse((x - r, y - r, x + r, y + r), outline=(255, 185, 0), width=3)
-    d.ellipse((x - 5, y - 5, x + 5, y + 5), fill=(255, 185, 0))
-    if click:
-        d.rectangle((x - r - 4, y - r - 4, x + r + 4, y + r + 4), outline=(255, 110, 40), width=2)
+def _load_frame(
+    path: Optional[str],
+) -> Optional[np.ndarray]:
 
-
-def _shot(step, job):
-    raw = step.get("screenshot")
-    if not raw:
+    if not path:
         return None
-    p = Path(raw)
-    if p.exists():
-        return p
-    p = Path(job) / raw
-    return p if p.exists() else None
+
+    if not os.path.exists(
+        path
+    ):
+        return None
+
+    image = cv2.imread(
+        path
+    )
+
+    if image is None:
+        return None
+
+    return _fit_image(
+        image
+    )
 
 
-def _norm_cursor(step):
-    c = step.get("cursor")
-    if isinstance(c, (list, tuple)) and len(c) >= 2:
-        try:
-            return float(c[0]), float(c[1])
-        except Exception:
-            return None
+# ----------------------------------------------------------------------
+# CAPTIONS
+# ----------------------------------------------------------------------
+
+def _draw_caption(
+    frame: np.ndarray,
+    text: str,
+    kind: str,
+) -> np.ndarray:
+
+    if not text:
+        return frame
+
+    lines = []
+
+    for raw in str(
+        text
+    ).splitlines():
+
+        raw = raw.strip()
+
+        if not raw:
+            continue
+
+        words = raw.split()
+
+        current = ""
+
+        for word in words:
+            candidate = (
+                f"{current} {word}".strip()
+            )
+
+            if len(candidate) > 70:
+                if current:
+                    lines.append(
+                        current
+                    )
+
+                current = word
+
+            else:
+                current = candidate
+
+        if current:
+            lines.append(
+                current
+            )
+
+    if not lines:
+        return frame
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    scale = 0.72
+    thickness = 2
+    line_height = 32
+    padding = 20
+
+    total_height = (
+        len(lines)
+        * line_height
+        + padding * 2
+    )
+
+    y1 = (
+        HEIGHT
+        - total_height
+        - 18
+    )
+
+    y2 = HEIGHT - 18
+
+    y1 = max(
+        HEIGHT // 2,
+        y1,
+    )
+
+    overlay = frame.copy()
+
+    cv2.rectangle(
+        overlay,
+        (
+            20,
+            y1,
+        ),
+        (
+            WIDTH - 20,
+            y2,
+        ),
+        (0, 0, 0),
+        -1,
+    )
+
+    frame = cv2.addWeighted(
+        overlay,
+        0.72,
+        frame,
+        0.28,
+        0,
+    )
+
+    text_y = (
+        y1
+        + padding
+        + 24
+    )
+
+    for line in lines:
+        (
+            tw,
+            th,
+        ), _ = cv2.getTextSize(
+            line,
+            font,
+            scale,
+            thickness,
+        )
+
+        x = (
+            WIDTH - tw
+        ) // 2
+
+        cv2.putText(
+            frame,
+            line,
+            (
+                x,
+                text_y,
+            ),
+            font,
+            scale,
+            (255, 255, 255),
+            thickness,
+            cv2.LINE_AA,
+        )
+
+        text_y += line_height
+
+    return frame
+
+
+# ----------------------------------------------------------------------
+# CURSOR
+# ----------------------------------------------------------------------
+
+def _valid_point(
+    point: Any,
+) -> bool:
+    return (
+        isinstance(
+            point,
+            (list, tuple),
+        )
+        and len(point) == 2
+    )
+
+
+def _normalise_point(
+    point,
+) -> Optional[
+    Tuple[float, float]
+]:
+
+    if not _valid_point(
+        point
+    ):
+        return None
+
+    try:
+        x = float(
+            point[0]
+        )
+
+        y = float(
+            point[1]
+        )
+
+    except Exception:
+        return None
+
+    if not (
+        0.0 <= x <= 1.0
+        and 0.0 <= y <= 1.0
+    ):
+        return None
+
+    return (
+        x,
+        y,
+    )
+
+
+def _draw_cursor(
+    frame: np.ndarray,
+    point: Tuple[float, float],
+    scale: float = 1.0,
+) -> np.ndarray:
+
+    x = int(
+        max(
+            0.0,
+            min(
+                1.0,
+                point[0],
+            ),
+        )
+        * WIDTH
+    )
+
+    y = int(
+        max(
+            0.0,
+            min(
+                1.0,
+                point[1],
+            ),
+        )
+        * HEIGHT
+    )
+
+    radius = max(
+        6,
+        int(
+            10 * scale
+        ),
+    )
+
+    cv2.circle(
+        frame,
+        (
+            x + 3,
+            y + 3,
+        ),
+        radius + 2,
+        (0, 0, 0),
+        -1,
+        cv2.LINE_AA,
+    )
+
+    cv2.circle(
+        frame,
+        (
+            x,
+            y,
+        ),
+        radius,
+        (255, 255, 255),
+        -1,
+        cv2.LINE_AA,
+    )
+
+    cv2.circle(
+        frame,
+        (
+            x,
+            y,
+        ),
+        radius,
+        (0, 0, 0),
+        2,
+        cv2.LINE_AA,
+    )
+
+    return frame
+
+
+def _draw_click(
+    frame: np.ndarray,
+    point: Tuple[float, float],
+    progress: float,
+) -> np.ndarray:
+
+    x = int(
+        max(
+            0.0,
+            min(
+                1.0,
+                point[0],
+            ),
+        )
+        * WIDTH
+    )
+
+    y = int(
+        max(
+            0.0,
+            min(
+                1.0,
+                point[1],
+            ),
+        )
+        * HEIGHT
+    )
+
+    progress = max(
+        0.0,
+        min(
+            1.0,
+            progress,
+        ),
+    )
+
+    radius = int(
+        12
+        + 35 * progress
+    )
+
+    thickness = max(
+        1,
+        int(
+            5
+            * (1.0 - progress)
+        ),
+    )
+
+    cv2.circle(
+        frame,
+        (
+            x,
+            y,
+        ),
+        radius,
+        (0, 0, 255),
+        thickness,
+        cv2.LINE_AA,
+    )
+
+    return frame
+
+
+def _interpolate(
+    start: Tuple[float, float],
+    end: Tuple[float, float],
+    t: float,
+) -> Tuple[float, float]:
+
+    t = max(
+        0.0,
+        min(
+            1.0,
+            t,
+        ),
+    )
+
+    # Smoothstep.
+    t = (
+        t
+        * t
+        * (
+            3.0
+            - 2.0 * t
+        )
+    )
+
+    return (
+        start[0]
+        + (
+            end[0]
+            - start[0]
+        )
+        * t,
+
+        start[1]
+        + (
+            end[1]
+            - start[1]
+        )
+        * t,
+    )
+
+
+# ----------------------------------------------------------------------
+# SCENE TARGET
+# ----------------------------------------------------------------------
+
+def _scene_target(
+    scene: Dict[str, Any],
+) -> Optional[
+    Tuple[float, float]
+]:
+
+    target = _normalise_point(
+        scene.get(
+            "cursor"
+        )
+    )
+
+    if target:
+        return target
+
+    actions = (
+        scene.get(
+            "actions"
+        )
+        or []
+    )
+
+    for action in actions:
+
+        if not isinstance(
+            action,
+            dict,
+        ):
+            continue
+
+        target = _normalise_point(
+            action.get(
+                "target"
+            )
+        )
+
+        if target:
+            return target
+
     return None
 
 
-def _duration(step, audio, i):
-    if i < len(audio):
-        item = audio[i]
-        p = item.get("path")
-        if p and Path(p).exists():
-            d = wav_duration(p)
-            if d > 0:
-                return d
-        try:
-            d = float(item.get("duration", 0))
-            if d > 0:
-                return d
-        except Exception:
-            pass
-    words = len(str(step.get("narration") or step.get("title") or "").split())
-    return max(2.2, min(7.0, words / 2.8 + 0.8))
+# ----------------------------------------------------------------------
+# AUDIO / SCENE DURATION
+# ----------------------------------------------------------------------
+
+def _audio_duration_for_scene(
+    scene: Dict[str, Any],
+    index: int,
+    audio_paths: List[str],
+) -> float:
+
+    # The most reliable mapping is a direct audio index.
+    if index < len(
+        audio_paths
+    ):
+        return _duration(
+            audio_paths[index]
+        )
+
+    narration = (
+        scene.get(
+            "narration"
+        )
+        or scene.get(
+            "tts_narration"
+        )
+        or ""
+    )
+
+    if narration:
+        # Reasonable fallback when TTS output has
+        # fewer files than scenes.
+        words = len(
+            str(narration).split()
+        )
+
+        return max(
+            1.2,
+            min(
+                8.0,
+                words / 2.5,
+            ),
+        )
+
+    if scene.get(
+        "kind"
+    ) == "topic":
+        return 2.0
+
+    return 2.0
 
 
-def render(plan, audio, job, final, progress_callback=None):
-    job = Path(job)
-    final = Path(final)
-    final.parent.mkdir(parents=True, exist_ok=True)
-    steps = plan.get("steps", []) if isinstance(plan, dict) else []
+# ----------------------------------------------------------------------
+# RAW VIDEO
+# ----------------------------------------------------------------------
+
+def _write_raw_video(
+    plan: Dict[str, Any],
+    audio: Any,
+    output_path: str,
+) -> None:
+
+    steps = (
+        plan.get(
+            "steps"
+        )
+        or []
+    )
+
     if not steps:
-        raise RuntimeError("Tutorial plan contains no action scenes.")
+        raise RuntimeError(
+            "Tutorial plan contains no scenes."
+        )
 
-    silent = job / "video_silent.mp4"
-    cmd = [
-        FFMPEG, "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
-        "-s", f"{W}x{H}", "-r", str(FPS), "-i", "-", "-an",
-        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-        "-crf", "23", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(silent),
-    ]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    prev = (W * 0.15, H * 0.20)
-    timeline = []
+    audio_paths = _audio_files(
+        audio
+    )
+
+    writer = cv2.VideoWriter(
+        output_path,
+        cv2.VideoWriter_fourcc(
+            *"mp4v"
+        ),
+        FPS,
+        (
+            WIDTH,
+            HEIGHT,
+        ),
+    )
+
+    if not writer.isOpened():
+        raise RuntimeError(
+            "Could not open raw video writer."
+        )
+
+    previous_frame = None
 
     try:
-        for i, step in enumerate(steps):
-            duration = _duration(step, audio, i)
-            shot = _shot(step, job)
-            if not shot:
-                # Do not inject a random PDF page, logo, cover, or document page.
-                # The step remains narratable but is represented by a clean action card.
-                base = Image.new("RGB", (W, H), (245, 245, 245))
-                cursor_target = (W * 0.50, H * 0.48)
-                has_screenshot = False
-            else:
-                src = Image.open(shot).convert("RGB")
-                base, ox, oy, scale = fit_image(src)
-                c = _norm_cursor(step) or (0.50, 0.50)
-                cursor_target = (ox + c[0] * src.width * scale, oy + c[1] * src.height * scale)
-                has_screenshot = True
+        for index, scene in enumerate(
+            steps
+        ):
 
-            frames = max(1, int(round(duration * FPS)))
-            move_frames = min(frames, max(18, int(frames * 0.32)))
-            path = cursor_path(prev, cursor_target, move_frames)
+            screenshot = scene.get(
+                "screenshot"
+            )
 
-            for fi in range(frames):
-                frame = base.copy()
-                if not has_screenshot:
-                    d = ImageDraw.Draw(frame)
-                    try:
-                        title_font = ImageFont.truetype("arial.ttf", 34)
-                        body_font = ImageFont.truetype("arial.ttf", 22)
-                    except Exception:
-                        title_font = body_font = ImageFont.load_default()
-                    d.text((70, 80), str(step.get("title") or "Action"), fill=(25, 25, 25), font=title_font)
-                    d.text((70, 150), "Visual reference not available in this step.", fill=(70, 70, 70), font=body_font)
+            frame = _load_frame(
+                screenshot
+            )
 
-                target_pt = path[fi] if fi < len(path) else cursor_target
-                clicking = move_frames <= fi < min(frames, move_frames + max(7, int(FPS * 0.22)))
-                draw_target(frame, target_pt[0], target_pt[1], clicking)
-                draw_cursor(frame, target_pt[0] + 4, target_pt[1] + 4, clicking)
-                draw_caption(frame, step.get("caption") or step.get("narration") or step.get("title", ""))
-                proc.stdin.write(frame.tobytes())
+            if frame is None:
 
-            prev = cursor_target
-            timeline.append({"duration": duration})
-            print(f"[VIDEO] scene={i + 1}/{len(steps)} screenshot={shot.name if shot else 'none'} cursor=visible target={step.get('visual_target','')}")
-            if progress_callback:
-                progress_callback(75 + int(15 * ((i + 1) / max(1, len(steps)))), f"Rendering step {i + 1} of {len(steps)}")
+                if previous_frame is not None:
+                    frame = previous_frame.copy()
+
+                else:
+                    frame = np.zeros(
+                        (
+                            HEIGHT,
+                            WIDTH,
+                            3,
+                        ),
+                        dtype=np.uint8,
+                    )
+
+            previous_frame = frame.copy()
+
+            duration = _audio_duration_for_scene(
+                scene,
+                index,
+                audio_paths,
+            )
+
+            frame_count = max(
+                1,
+                int(
+                    duration * FPS
+                ),
+            )
+
+            kind = scene.get(
+                "kind",
+                "action",
+            )
+
+            target = _scene_target(
+                scene
+            )
+
+            # Cursor is shown ONLY when an actual
+            # grounded target exists.
+            show_cursor = (
+                kind == "action"
+                and target is not None
+            )
+
+            for frame_index in range(
+                frame_count
+            ):
+
+                current = frame.copy()
+
+                if show_cursor:
+
+                    movement_frames = max(
+                        1,
+                        int(
+                            FPS * 0.55
+                        ),
+                    )
+
+                    movement_fraction = min(
+                        1.0,
+                        frame_index
+                        / float(
+                            movement_frames
+                        ),
+                    )
+
+                    # Start just outside the
+                    # target region rather than
+                    # appearing at the target.
+                    start = (
+                        max(
+                            0.02,
+                            min(
+                                0.95,
+                                target[0]
+                                - 0.18,
+                            ),
+                        ),
+                        max(
+                            0.02,
+                            min(
+                                0.90,
+                                target[1]
+                                - 0.12,
+                            ),
+                        ),
+                    )
+
+                    cursor_pos = _interpolate(
+                        start,
+                        target,
+                        movement_fraction,
+                    )
+
+                    current = _draw_cursor(
+                        current,
+                        cursor_pos,
+                    )
+
+                    # Click pulse near end.
+                    remaining = (
+                        frame_count
+                        - frame_index
+                    )
+
+                    click_frames = max(
+                        1,
+                        int(
+                            FPS * 0.25
+                        ),
+                    )
+
+                    if remaining <= click_frames:
+
+                        pulse_progress = 1.0 - (
+                            remaining
+                            / float(
+                                click_frames
+                            )
+                        )
+
+                        current = _draw_click(
+                            current,
+                            target,
+                            pulse_progress,
+                        )
+
+                current = _draw_caption(
+                    current,
+                    scene.get(
+                        "caption",
+                        "",
+                    ),
+                    kind,
+                )
+
+                writer.write(
+                    current
+                )
+
     finally:
-        proc.stdin.close()
+        writer.release()
 
-    err = proc.stderr.read()
-    rc = proc.wait()
-    if rc != 0:
-        raise RuntimeError("FFmpeg video rendering failed:\n" + err.decode(errors="replace"))
 
-    audio_files = []
-    for i, item in enumerate(timeline):
-        p = Path(audio[i].get("path")) if i < len(audio) and audio[i].get("path") else None
-        if not p or not p.exists():
-            p = job / "audio" / f"silent_{i:03d}.wav"
-            create_silent_wav(p, item["duration"])
-        audio_files.append(p)
+# ----------------------------------------------------------------------
+# AUDIO CONCAT
+# ----------------------------------------------------------------------
 
-    concat = job / "concat_audio.txt"
-    concat.write_text("\n".join(f"file '{p.resolve().as_posix()}'" for p in audio_files), encoding="utf-8")
-    narration = job / "narration.wav"
-    subprocess.run(
-        [FFMPEG, "-y", "-f", "concat", "-safe", "0", "-i", str(concat), "-c:a", "pcm_s16le", str(narration)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        check=True,
+def _build_audio_concat(
+    audio_paths: List[str],
+    output_dir: str,
+) -> Optional[str]:
+
+    if not audio_paths:
+        print(
+            "[AUDIO] No audio files found."
+        )
+        return None
+
+    concat_file = os.path.join(
+        output_dir,
+        "audio_concat.txt",
     )
 
-    total_v = sum(x["duration"] for x in timeline)
-    total_a = wav_duration(narration)
-    duration = min(total_v, total_a) if total_a > 0 else total_v
-
-    subprocess.run(
-        [FFMPEG, "-y", "-i", str(silent), "-i", str(narration), "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-t", f"{duration:.3f}", "-movflags", "+faststart", str(final)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        check=True,
+    narration_file = os.path.join(
+        output_dir,
+        "narration.wav",
     )
-    return final
+
+    with open(
+        concat_file,
+        "w",
+        encoding="utf-8",
+    ) as f:
+
+        for path in audio_paths:
+
+            absolute = os.path.abspath(
+                path
+            )
+
+            # FFmpeg concat file syntax.
+            safe_path = (
+                absolute
+                .replace(
+                    "\\",
+                    "/",
+                )
+                .replace(
+                    "'",
+                    "'\\''",
+                )
+            )
+
+            f.write(
+                f"file '{safe_path}'\n"
+            )
+
+    command = [
+        "ffmpeg",
+        "-y",
+
+        "-f",
+        "concat",
+
+        "-safe",
+        "0",
+
+        "-i",
+        concat_file,
+
+        "-c:a",
+        "pcm_s16le",
+
+        narration_file,
+    ]
+
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+
+        print(
+            "[FFMPEG] audio concat failed"
+        )
+
+        print(
+            result.stdout
+        )
+
+        print(
+            result.stderr
+        )
+
+        return None
+
+    if not os.path.exists(
+        narration_file
+    ):
+        return None
+
+    return narration_file
+
+
+# ----------------------------------------------------------------------
+# FINAL MP4
+# ----------------------------------------------------------------------
+
+def _finalize_with_ffmpeg(
+    raw_video: str,
+    narration: Optional[str],
+    final_path: str,
+) -> None:
+
+    if (
+        narration
+        and os.path.exists(
+            narration
+        )
+    ):
+
+        command = [
+            "ffmpeg",
+            "-y",
+
+            "-i",
+            raw_video,
+
+            "-i",
+            narration,
+
+            "-map",
+            "0:v:0",
+
+            "-map",
+            "1:a:0",
+
+            "-c:v",
+            "libx264",
+
+            "-preset",
+            "veryfast",
+
+            "-crf",
+            "20",
+
+            "-pix_fmt",
+            "yuv420p",
+
+            "-c:a",
+            "aac",
+
+            "-b:a",
+            "128k",
+
+            "-ar",
+            "48000",
+
+            "-movflags",
+            "+faststart",
+
+            "-shortest",
+
+            final_path,
+        ]
+
+    else:
+
+        print(
+            "[AUDIO] Final video will contain no audio "
+            "because no narration WAV was produced."
+        )
+
+        command = [
+            "ffmpeg",
+            "-y",
+
+            "-i",
+            raw_video,
+
+            "-map",
+            "0:v:0",
+
+            "-c:v",
+            "libx264",
+
+            "-preset",
+            "veryfast",
+
+            "-crf",
+            "20",
+
+            "-pix_fmt",
+            "yuv420p",
+
+            "-an",
+
+            "-movflags",
+            "+faststart",
+
+            final_path,
+        ]
+
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+    )
+
+    print(
+        "[FFMPEG]"
+    )
+
+    if result.stdout:
+        print(
+            result.stdout
+        )
+
+    if result.stderr:
+        print(
+            result.stderr
+        )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            "FFmpeg failed to create final MP4."
+        )
+
+    if not os.path.exists(
+        final_path
+    ):
+        raise RuntimeError(
+            "FFmpeg reported success but "
+            "the final MP4 does not exist."
+        )
+
+
+# ----------------------------------------------------------------------
+# PUBLIC RENDER FUNCTION
+# ----------------------------------------------------------------------
+
+def render(
+    plan: Dict[str, Any],
+    audio: Any,
+    job_dir: str,
+    final_path: str,
+) -> str:
+
+    job_dir = str(
+        job_dir
+    )
+
+    os.makedirs(
+        job_dir,
+        exist_ok=True,
+    )
+
+    final_path = str(
+        final_path
+    )
+
+    raw_video = os.path.join(
+        job_dir,
+        "video_raw.mp4",
+    )
+
+    audio_paths = _audio_files(
+        audio
+    )
+
+    print(
+        f"[RENDER] scenes={len(plan.get('steps') or [])}"
+    )
+
+    print(
+        f"[RENDER] audio_files={len(audio_paths)}"
+    )
+
+    narration = _build_audio_concat(
+        audio_paths,
+        job_dir,
+    )
+
+    _write_raw_video(
+        plan,
+        audio,
+        raw_video,
+    )
+
+    _finalize_with_ffmpeg(
+        raw_video,
+        narration,
+        final_path,
+    )
+
+    print(
+        f"[RENDER] final={final_path}"
+    )
+
+    return final_path

@@ -11,31 +11,49 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+
 BASE = Path(__file__).resolve().parent.parent
 load_dotenv(BASE / ".env")
+
 
 from app.services.pdf_service import process_pdf
 from app.services.ai_service import build_tutorial_plan
 from app.services.tts_service import generate_narration
 from app.services.video_service import render
 
+
 JOBS = BASE / "jobs"
 JOBS.mkdir(parents=True, exist_ok=True)
 
 jobs = {}
+
 pool = ThreadPoolExecutor(max_workers=2)
 
 app = FastAPI(title="Teamcenter AI Studio v2")
 
-app.mount("/static", StaticFiles(directory=BASE / "app" / "static"), name="static")
-app.mount("/media", StaticFiles(directory=JOBS), name="media")
+app.mount(
+    "/static",
+    StaticFiles(directory=BASE / "app" / "static"),
+    name="static",
+)
 
-templates = Jinja2Templates(directory=str(BASE / "app" / "templates"))
+app.mount(
+    "/media",
+    StaticFiles(directory=JOBS),
+    name="media",
+)
+
+templates = Jinja2Templates(
+    directory=str(BASE / "app" / "templates")
+)
 
 
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
-    return templates.TemplateResponse(request=request, name="index.html")
+    return templates.TemplateResponse(
+        request=request,
+        name="index.html",
+    )
 
 
 @app.get("/health")
@@ -57,8 +75,12 @@ async def generate(file: UploadFile = File(...)):
         )
 
     jid = uuid4().hex[:10]
+
     job = JOBS / jid
-    job.mkdir(parents=True, exist_ok=True)
+    job.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     pdf = job / "source.pdf"
     pdf.write_bytes(await file.read())
@@ -76,7 +98,9 @@ async def generate(file: UploadFile = File(...)):
         pdf,
     )
 
-    return {"job_id": jid}
+    return {
+        "job_id": jid,
+    }
 
 
 @app.get("/status/{jid}")
@@ -92,40 +116,75 @@ async def status(jid: str):
 
 def run_job(jid, pdf):
     try:
-        # IMPORTANT: pdf is .../jobs/<jid>/source.pdf.
-        # The job directory is the parent of the PDF file.
         job = Path(pdf).parent
 
         jobs[jid].update(
             status="processing",
             progress=8,
-            message="Reading the document and extracting embedded screenshots",
+            message=(
+                "Reading the document and extracting "
+                "embedded screenshots"
+            ),
         )
 
         print(f"[JOB] {jid} PDF={pdf}")
         print(f"[JOB] {jid} JOB_DIR={job}")
 
-        data = process_pdf(pdf, job)
+        # ---------------------------------------------------------
+        # 1. PDF
+        # ---------------------------------------------------------
+
+        data = process_pdf(
+            pdf,
+            job,
+        )
+
+        pages = data.get("pages", [])
+        screenshots = data.get("screenshots", [])
 
         jobs[jid].update(
             progress=28,
             message=(
-                f"Extracted {len(data.get('pages', []))} pages and "
-                f"{len(data.get('screenshots', []))} embedded visual regions"
+                f"Extracted {len(pages)} pages and "
+                f"{len(screenshots)} embedded visual regions"
             ),
         )
 
-        def plan_progress(progress, message):
-            # Keep planning in the 28-50% range.
+        # ---------------------------------------------------------
+        # 2. AI PLAN
+        # ---------------------------------------------------------
+
+        def plan_progress(
+            progress,
+            message="Building tutorial plan",
+        ):
+            """
+            Planning progress is expected to be 0-100.
+
+            build_tutorial_plan is allowed to report either:
+                callback(progress)
+            or:
+                callback(progress, message)
+
+            The default message makes the interface tolerant.
+            """
+
             try:
                 p = int(progress)
             except Exception:
                 p = 0
 
-            mapped = 28 + max(0, min(22, p))
+            p = max(0, min(100, p))
+
+            mapped = 28 + int(
+                22 * (p / 100.0)
+            )
+
             jobs[jid].update(
                 progress=mapped,
-                message=message,
+                message=str(
+                    message or "Building tutorial plan"
+                ),
             )
 
         plan = build_tutorial_plan(
@@ -145,10 +204,18 @@ def run_job(jid, pdf):
 
         jobs[jid].update(
             progress=50,
-            message="Generating English narration with Kokoro",
+            message="Generating narration",
         )
 
-        def tts_progress(current, total, message):
+        # ---------------------------------------------------------
+        # 3. TTS
+        # ---------------------------------------------------------
+
+        def tts_progress(
+            current,
+            total,
+            message="Generating narration",
+        ):
             try:
                 current = int(current)
                 total = int(total)
@@ -157,13 +224,24 @@ def run_job(jid, pdf):
                 total = 0
 
             if total > 0:
-                progress = 50 + int(20 * min(1.0, current / total))
+                fraction = min(
+                    1.0,
+                    max(
+                        0.0,
+                        current / float(total),
+                    ),
+                )
+                progress = 50 + int(
+                    20 * fraction
+                )
             else:
                 progress = 50
 
             jobs[jid].update(
                 progress=min(70, progress),
-                message=message,
+                message=str(
+                    message or "Generating narration"
+                ),
             )
 
         audio = generate_narration(
@@ -185,8 +263,15 @@ def run_job(jid, pdf):
 
         jobs[jid].update(
             progress=75,
-            message="Rendering screenshots, cursor guidance, captions and narration",
+            message=(
+                "Rendering screenshots, cursor guidance, "
+                "captions and narration"
+            ),
         )
+
+        # ---------------------------------------------------------
+        # 4. VIDEO
+        # ---------------------------------------------------------
 
         final = job / "tutorial.mp4"
 
@@ -197,7 +282,10 @@ def run_job(jid, pdf):
             final,
         )
 
-        if not final.exists() or final.stat().st_size < 10000:
+        if (
+            not final.exists()
+            or final.stat().st_size < 10000
+        ):
             raise RuntimeError(
                 "Generated video is missing or invalid."
             )
@@ -206,14 +294,20 @@ def run_job(jid, pdf):
             status="completed",
             progress=100,
             message="Tutorial ready",
-            video_url=f"/media/{jid}/tutorial.mp4",
+            video_url=(
+                f"/media/{jid}/tutorial.mp4"
+            ),
             video_path=str(final),
-            title=plan.get("title", "AI Learning Tutorial"),
+            title=plan.get(
+                "title",
+                "AI Learning Tutorial",
+            ),
         )
 
         print(
             f"[VIDEO] {jid} generated successfully: "
-            f"{final} ({final.stat().st_size / (1024 * 1024):.2f} MB)"
+            f"{final} "
+            f"({final.stat().st_size / (1024 * 1024):.2f} MB)"
         )
 
     except Exception as exc:

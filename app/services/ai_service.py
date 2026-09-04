@@ -1,437 +1,1719 @@
-from pathlib import Path
 import json
 import os
 import re
-import time
+from difflib import SequenceMatcher
+from typing import Any, Dict, List, Optional
+
 import requests
-from dotenv import load_dotenv
-load_dotenv()
+
 from app.services.local_vision import analyze_image
 
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
-OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "15"))
-OLLAMA_NARRATION_ENABLED = os.getenv("OLLAMA_NARRATION_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
-VISION_ENABLED = os.getenv("OLLAMA_VISION_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
-VISION_TIMEOUT = int(os.getenv("OLLAMA_VISION_TIMEOUT", "20"))
-VISION_MIN_CONFIDENCE = float(os.getenv("OLLAMA_VISION_MIN_CONFIDENCE", "0.55"))
 
+OLLAMA_URL = os.getenv(
+    "OLLAMA_URL",
+    "http://localhost:11434/api/generate",
+)
 
-def _clean(v):
-    return re.sub(r"\s+", " ", str(v or "")).strip()
+OLLAMA_MODEL = os.getenv(
+    "OLLAMA_MODEL",
+    "llama3.2",
+)
 
+OLLAMA_TIMEOUT = int(
+    os.getenv("OLLAMA_TIMEOUT", "60")
+)
 
-def _parse_json(raw):
-    raw = str(raw or "").strip()
-    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.I)
-    raw = re.sub(r"\s*```$", "", raw)
-    try:
-        value = json.loads(raw)
-    except Exception:
-        a, b = raw.find("{"), raw.rfind("}")
-        if a < 0 or b <= a:
-            raise ValueError("Ollama returned invalid JSON")
-        value = json.loads(raw[a:b + 1])
-    return value if isinstance(value, dict) else {"items": value}
+VISION_ENABLED = (
+    os.getenv(
+        "OLLAMA_VISION_ENABLED",
+        "true",
+    ).lower()
+    == "true"
+)
 
-
-def _ollama(prompt, timeout=None, num_predict=280, temperature=0.0):
-    payload = {
-        "model": OLLAMA_MODEL,
-        "prompt": str(prompt),
-        "stream": False,
-        "format": "json",
-        "keep_alive": "0",
-        "options": {
-            "temperature": temperature,
-            "num_predict": num_predict,
-            "num_ctx": 4096,
-        },
-    }
-    start = time.time()
-    with requests.Session() as session:
-        session.trust_env = False
-        response = session.post(
-            f"{OLLAMA_HOST.rstrip('/')}/api/generate",
-            json=payload,
-            timeout=timeout or OLLAMA_TIMEOUT,
-        )
-    print(f"[AI] Ollama {time.time() - start:.2f}s prompt_chars={len(str(prompt))}")
-    response.raise_for_status()
-    return _parse_json(response.json().get("response", ""))
-
-
-_NUMBERED = re.compile(r"^(?:step\s*)?(\d+)\s*[\).:\-]\s*(.+?)\s*$", re.I)
-_ACTION_START = re.compile(
-    r"^(?:click|double[- ]click|right[- ]click|select|choose|open|launch|press|type|enter|set|fill|check|uncheck|go to|navigate to|create|add|remove|delete|save|submit|upload|download|browse|search|filter|attach|confirm|cancel|expand|collapse|drag|drop|login|sign in)\b",
-    re.I,
+VISION_MIN_CONFIDENCE = float(
+    os.getenv(
+        "VISION_MIN_CONFIDENCE",
+        "0.40",
+    )
 )
 
 
-def _numbered_steps(pages):
-    candidates = []
-    for p in pages or []:
-        for idx, raw in enumerate(str(p.get("text", "")).splitlines()):
-            line = _clean(raw).strip("-•* ")
-            m = _NUMBERED.match(line)
-            if not m:
-                continue
-            title = _clean(m.group(2))
-            if 3 <= len(title) <= 220 and not title.lower().startswith(("note:", "warning:", "example:")):
-                candidates.append({
-                    "number": int(m.group(1)),
-                    "title": title,
-                    "source_page": p.get("page"),
-                    "line_index": idx,
-                })
-    if not candidates:
-        return []
-    runs, cur, prev = [], [], None
-    for x in candidates:
-        if prev is None or x["number"] == prev + 1:
-            cur.append(x)
-        elif x["number"] == 1:
-            if cur:
-                runs.append(cur)
-            cur = [x]
-        else:
-            if cur:
-                runs.append(cur)
-            cur = [x]
-        prev = x["number"]
-    if cur:
-        runs.append(cur)
-    runs.sort(key=lambda r: (len(r), r[0]["number"] == 1), reverse=True)
-    result, seen = [], set()
-    for x in runs[0]:
-        if x["number"] not in seen:
-            seen.add(x["number"])
-            result.append(x)
-    return result
+# ----------------------------------------------------------------------
+# GENERAL HELPERS
+# ----------------------------------------------------------------------
 
+def _ollama(
+    prompt: str,
+    timeout: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "format": "json",
+        "options": {
+            "temperature": 0.1,
+            "num_ctx": 8192,
+        },
+    }
 
-def _action_heuristic(pages):
-    out, seen = [], set()
-    for p in pages or []:
-        for idx, raw in enumerate(str(p.get("text", "")).splitlines()):
-            line = _clean(raw).strip("-•* ")
-            if not line or len(line) > 220 or not _ACTION_START.match(line):
-                continue
-            key = line.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append({"number": len(out) + 1, "title": line, "source_page": p.get("page"), "line_index": idx})
-    return out
-
-
-def _ai_extract_actions(pages):
-    if not (OLLAMA_NARRATION_ENABLED and pages):
-        return []
-    source = "\n\n".join(
-        f"PAGE {p.get('page')}: {_clean(p.get('text',''))[:900]}"
-        for p in pages if _clean(p.get("text", ""))
-    )[:9000]
-    if not source:
-        return []
-    prompt = f"""
-Identify ONLY the explicit user actions that form the software procedure in this training document.
-Exclude introductions, descriptions, notes, warnings, logos, examples, and outcomes.
-Preserve the document order.
-Return ONLY JSON: {{"steps":[{{"number":1,"title":"...","source_page":1}}]}}
-
-{source}
-"""
     try:
-        parsed = _ollama(prompt, timeout=OLLAMA_TIMEOUT, num_predict=260, temperature=0.0)
-        result = []
-        for i, item in enumerate(parsed.get("steps", []), 1):
-            if not isinstance(item, dict) or not _clean(item.get("title")):
-                continue
-            try:
-                page = int(item.get("source_page")) if item.get("source_page") is not None else None
-            except Exception:
-                page = None
-            result.append({"number": i, "title": _clean(item["title"]), "source_page": page, "line_index": None})
-        return result
-    except Exception as exc:
-        print(f"[AI] action extraction unavailable: {exc}")
-        return []
+        response = requests.post(
+            OLLAMA_URL,
+            json=payload,
+            timeout=timeout or OLLAMA_TIMEOUT,
+        )
 
+        response.raise_for_status()
 
-def _page_map(pages):
-    return {int(p["page"]): p for p in pages or [] if p.get("page") is not None}
+        data = response.json()
 
+        text = data.get("response", "")
 
-def _target_query(title):
-    title = _clean(title)
-    m = re.match(
-        r"^(?:double[- ]click|right[- ]click|click|select|choose|open|launch|press|type|enter|set|fill|check|uncheck|go to|navigate to|drag|drop)\s+(?:the\s+)?(.+)$",
-        title,
-        re.I,
-    )
-    q = _clean(m.group(1)) if m else title
-    q = re.sub(r"\b(button|field|menu|tab|link|icon|option|box|dropdown|drop-down|area|screen|control)\b", "", q, flags=re.I)
-    return _clean(q).strip(" .,:;\"'")
+        if not text:
+            return None
 
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
 
-def _find_text_target(step, page):
-    if not page:
-        return None
-    words = page.get("words") or []
-    if not words:
-        return None
-    query = _target_query(step.get("title", ""))
-    tokens = [re.sub(r"[^\w@#$%&+\-/]", "", t.lower()) for t in re.findall(r"[\w@#$%&+\-/]+", query)]
-    tokens = [t for t in tokens if t]
-    norm = [re.sub(r"[^\w@#$%&+\-/]", "", _clean(w.get("text", "")).lower()) for w in words]
-    for n in range(min(len(tokens), 5), 0, -1):
-        target = tokens[:n]
-        for i in range(0, max(0, len(words) - n + 1)):
-            if norm[i:i + n] != target:
-                continue
-            chunk = words[i:i + n]
-            x0 = min(float(w["x0"]) for w in chunk); y0 = min(float(w["y0"]) for w in chunk)
-            x1 = max(float(w["x1"]) for w in chunk); y1 = max(float(w["y1"]) for w in chunk)
-            return (
-                ((x0 + x1) / 2) / float(page.get("width") or 1),
-                ((y0 + y1) / 2) / float(page.get("height") or 1),
-                query,
+        match = re.search(
+            r"\{.*\}",
+            text,
+            re.DOTALL,
+        )
+
+        if match:
+            return json.loads(
+                match.group(0)
             )
-    for token in tokens:
-        if len(token) < 3:
-            continue
-        for w, nw in zip(words, norm):
-            if nw == token:
-                return (
-                    ((float(w["x0"]) + float(w["x1"])) / 2) / float(page.get("width") or 1),
-                    ((float(w["y0"]) + float(w["y1"])) / 2) / float(page.get("height") or 1),
-                    token,
-                )
+
+    except Exception as exc:
+        print(f"[OLLAMA] error: {exc}")
+
     return None
 
 
-def _choose_screenshot(step, screenshots, pages):
-    page_no = step.get("source_page")
-    candidates = [s for s in screenshots if s.get("page") == page_no and s.get("source_type") == "embedded_screenshot"]
-    if not candidates:
-        return None
-    page = _page_map(pages).get(page_no)
-    target = _find_text_target(step, page)
-    page_h = float(page.get("height") or 1) if page else 1
+def _clean_text(value: Any) -> str:
+    if value is None:
+        return ""
 
-    def rank(s):
-        score = float(s.get("score", 0) or 0)
-        if s.get("repeated_visual"):
-            score -= 2.0
-        box = s.get("bbox") or [0, 0, 0, 0]
-        if target and page:
-            target_y = target[1] * page_h
-            image_cy = (float(box[1]) + float(box[3])) / 2
-            score -= abs(image_cy - target_y) / page_h * 3.0
-        return score
-    return max(candidates, key=rank)
+    text = str(value)
+
+    text = text.replace(
+        "\r",
+        " ",
+    )
+
+    text = re.sub(
+        r"[ \t]+",
+        " ",
+        text,
+    )
+
+    return text.strip()
 
 
-def _page_cursor_to_screenshot(page_target, screenshot, page):
-    try:
-        nx, ny = float(page_target[0]), float(page_target[1])
-        pw, ph = float(page.get("width") or 1), float(page.get("height") or 1)
-        bx0, by0, bx1, by1 = map(float, screenshot.get("bbox") or [0, 0, pw, ph])
-        x, y = nx * pw, ny * ph
-        if not (bx0 <= x <= bx1 and by0 <= y <= by1):
-            return None
-        return (
-            (x - bx0) / max(1e-6, bx1 - bx0),
-            (y - by0) / max(1e-6, by1 - by0),
+def _extract_urls(text: str) -> List[str]:
+    urls = re.findall(
+        r"https?://[^\s)\]>]+",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    result = []
+
+    for url in urls:
+        url = url.rstrip(
+            ".,;:"
         )
-    except Exception:
-        return None
+
+        if url not in result:
+            result.append(url)
+
+    return result
 
 
-def _vision_target(step, screenshot):
-    if not (VISION_ENABLED and screenshot):
+def _remove_urls(text: str) -> str:
+    return re.sub(
+        r"https?://[^\s)\]>]+",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+
+def _is_metadata(line: str) -> bool:
+    line = _clean_text(line)
+
+    if not line:
+        return True
+
+    if re.match(
+        r"^page\s*\|?\s*\d+$",
+        line,
+        flags=re.IGNORECASE,
+    ):
+        return True
+
+    if re.match(
+        r"^page\s+\d+$",
+        line,
+        flags=re.IGNORECASE,
+    ):
+        return True
+
+    if line.lower() in {
+        "itl plm user manual",
+        "uploaded pdf",
+    }:
+        return True
+
+    return False
+
+
+def _normalise_source_text(
+    text: str,
+) -> str:
+    lines = []
+
+    for raw in text.splitlines():
+        line = _clean_text(raw)
+
+        if _is_metadata(line):
+            continue
+
+        if not line:
+            if lines and lines[-1] != "":
+                lines.append("")
+            continue
+
+        lines.append(line)
+
+    return "\n".join(lines)
+
+
+# ----------------------------------------------------------------------
+# HEADINGS / STRUCTURE
+# ----------------------------------------------------------------------
+
+def _looks_like_heading(
+    line: str,
+) -> bool:
+    line = _clean_text(line)
+
+    if not line:
+        return False
+
+    # Examples:
+    # 2 Classification Search
+    # 2.1 Purpose
+    # 3.4 Procedure
+    if re.match(
+        r"^\d+(?:\.\d+)*\s+[A-Za-z]",
+        line,
+    ):
+        return True
+
+    heading_words = {
+        "purpose",
+        "procedure",
+        "execute search",
+        "view filtered results",
+        "apply property-based filters",
+        "compare the selected parts",
+        "identify the required part",
+        "view in full screen",
+        "open the selected part in a new window",
+        "open the part in nx",
+        "select search type",
+        "part creation in teamcenter",
+        "update attributes",
+        "open in nx command",
+        "attachments visibility in active workspace",
+        "part creation in nx",
+        "conversion of temporary part to 3 series production part",
+        "geolus shape search",
+    }
+
+    return (
+        line.lower().rstrip(":")
+        in heading_words
+    )
+
+
+def _heading_level(
+    line: str,
+) -> int:
+    match = re.match(
+        r"^(\d+(?:\.\d+)*)\s+",
+        line,
+    )
+
+    if not match:
+        return 0
+
+    return match.group(1).count(".") + 1
+
+
+# ----------------------------------------------------------------------
+# ACTION DETECTION
+# ----------------------------------------------------------------------
+
+ACTION_VERBS = (
+    "open",
+    "click",
+    "select",
+    "enter",
+    "type",
+    "browse",
+    "launch",
+    "choose",
+    "apply",
+    "create",
+    "save",
+    "run",
+    "fill",
+    "search",
+    "locate",
+    "expand",
+    "collapse",
+    "double click",
+    "right click",
+    "drag",
+    "press",
+    "check",
+    "uncheck",
+)
+
+
+def _is_action_line(
+    line: str,
+) -> bool:
+    low = line.lower().strip()
+
+    return any(
+        re.match(
+            rf"^{re.escape(verb)}\b",
+            low,
+        )
+        for verb in ACTION_VERBS
+    )
+
+
+def _is_bad_segment(
+    text: str,
+) -> bool:
+    text = _clean_text(text)
+
+    if not text:
+        return True
+
+    if len(text.split()) <= 1:
+        if text.lower() in {
+            "type",
+            "select",
+            "click",
+            "open",
+            "add",
+            "enter",
+        }:
+            return True
+
+    if re.search(
+        r"\bonce\s+ready\s+can\s+be$",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return True
+
+    return False
+
+
+# ----------------------------------------------------------------------
+# COMPOUND ACTIONS
+# ----------------------------------------------------------------------
+
+def _split_compound_action(
+    text: str,
+) -> List[str]:
+    text = _clean_text(text)
+
+    if not text:
+        return []
+
+    text = re.sub(
+        r"\s+as shown below\.?$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # Explicit UI chains.
+    pieces = re.split(
+        r"\s*(?:>\s*|;\s*|\bthen\b|\band then\b)\s*",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    expanded = []
+
+    action_start = re.compile(
+        r"^(?:"
+        r"open|click|select|enter|type|browse|launch|"
+        r"choose|apply|create|save|run|fill|search|locate|"
+        r"expand|collapse|double\s+click|right\s+click|"
+        r"drag|press|check|uncheck"
+        r")\b",
+        flags=re.IGNORECASE,
+    )
+
+    for piece in pieces:
+        piece = _clean_text(piece)
+
+        if not piece:
+            continue
+
+        # Split:
+        # "Select the part and click Attachment tab."
+        matches = list(
+            re.finditer(
+                r"\s+\band\b\s+(?="
+                r"(?:open|click|select|enter|type|browse|"
+                r"launch|choose|apply|create|save|run|fill|"
+                r"search|locate|expand|collapse|double\s+click|"
+                r"right\s+click|drag|press|check|uncheck)"
+                r"\b)",
+                piece,
+                flags=re.IGNORECASE,
+            )
+        )
+
+        if matches:
+            start = 0
+
+            for match in matches:
+                first = _clean_text(
+                    piece[
+                        start:match.start()
+                    ]
+                )
+
+                if first:
+                    expanded.append(first)
+
+                start = match.end()
+
+            last = _clean_text(
+                piece[start:]
+            )
+
+            if last:
+                expanded.append(last)
+
+        else:
+            expanded.append(piece)
+
+    result = []
+
+    for piece in expanded:
+        piece = piece.strip(" .")
+
+        if not piece:
+            continue
+
+        # Do not accidentally turn ordinary prose into actions.
+        if not action_start.match(piece):
+            result.append(
+                piece + "."
+                if not piece.endswith(".")
+                else piece
+            )
+            continue
+
+        if not piece.endswith("."):
+            piece += "."
+
+        result.append(piece)
+
+    return result
+
+
+# ----------------------------------------------------------------------
+# HEURISTIC PLANNER
+# ----------------------------------------------------------------------
+
+def _heuristic_segments(
+    document_text: str,
+) -> List[Dict[str, Any]]:
+    text = _normalise_source_text(
+        document_text
+    )
+
+    lines = [
+        x
+        for x in text.splitlines()
+        if x.strip()
+    ]
+
+    segments = []
+
+    for line in lines:
+        if _looks_like_heading(line):
+            segments.append(
+                {
+                    "kind": "topic",
+                    "title": line,
+                    "content": line,
+                }
+            )
+            continue
+
+        if _is_action_line(line):
+            for piece in _split_compound_action(
+                line
+            ):
+                if not _is_bad_segment(piece):
+                    segments.append(
+                        {
+                            "kind": "action",
+                            "title": piece,
+                            "content": piece,
+                        }
+                    )
+            continue
+
+        # Ignore isolated UI labels.
+        if (
+            len(line.split()) <= 2
+            and line.lower()
+            in {
+                "type",
+                "select",
+                "add",
+            }
+        ):
+            continue
+
+        segments.append(
+            {
+                "kind": "explanation",
+                "title": "",
+                "content": line,
+            }
+        )
+
+    return segments
+
+
+# ----------------------------------------------------------------------
+# AI PLANNER
+# ----------------------------------------------------------------------
+
+def _ai_extract_segments(
+    document_text: str,
+) -> List[Dict[str, Any]]:
+    cleaned = _normalise_source_text(
+        document_text
+    )
+
+    prompt = f"""
+You are the document planner for a professional
+software training video.
+
+Convert the supplied software manual into an ordered
+training plan.
+
+The source document is authoritative.
+
+DO NOT invent information.
+
+DO NOT omit meaningful information.
+
+DO NOT expand the document with your own explanations.
+
+DO NOT add generic training filler.
+
+DO NOT read page numbers or document metadata.
+
+PRESERVE THE ORDER of the source document.
+
+Classify meaningful content as:
+
+topic
+------
+A section or subsection introducing a subject or procedure.
+
+Examples:
+"2 Classification Search"
+"3 Geolus Shape Search"
+"4 Part Creation in Teamcenter"
+
+explanation
+-----------
+Important information explaining:
+- purpose
+- context
+- prerequisites
+- what a feature does
+- why it is used
+- important operational information
+
+action
+------
+A concrete user operation:
+- open
+- click
+- select
+- enter
+- type
+- browse
+- launch
+- choose
+- apply
+- create
+- save
+- run
+- fill
+- search
+- locate
+- expand
+- collapse
+- etc.
+
+VERY IMPORTANT:
+
+Do not merge separate UI interactions.
+
+For example:
+
+"Click Add button and select ITL Design Part from drop down."
+
+MUST become:
+
+action: "Click Add button."
+action: "Select ITL Design Part from the drop down."
+
+Likewise:
+
+"Select the part and click Attachment tab."
+
+MUST become:
+
+action: "Select the part."
+action: "Click the Attachment tab."
+
+Do not create fragments such as:
+
+"Type"
+"Select"
+"Create temporary Part and once ready can be"
+
+Use surrounding source text to reconstruct an extraction-fragment
+when the continuation is explicitly present elsewhere in the source.
+
+Do not invent missing text.
+
+EXPLANATIONS:
+
+Keep useful explanatory information.
+
+Do NOT compress several important facts into one vague sentence.
+
+If a paragraph or bullet list contains several related facts,
+combine them into one or two concise sentences while preserving
+the important meaning.
+
+URLS:
+
+Preserve URLs in content.
+
+Never put the URL into spoken narration.
+
+The video renderer will display the URL visually.
+
+Return ONLY JSON:
+
+{{
+  "title": "short useful tutorial title",
+  "segments": [
+    {{
+      "kind": "topic|explanation|action",
+      "title": "short title",
+      "content": "document-grounded content"
+    }}
+  ]
+}}
+
+DOCUMENT:
+{cleaned}
+"""
+
+    result = _ollama(prompt)
+
+    if not result:
+        return []
+
+    raw_segments = result.get(
+        "segments"
+    )
+
+    if not isinstance(
+        raw_segments,
+        list,
+    ):
+        return []
+
+    output = []
+
+    for item in raw_segments:
+        if not isinstance(
+            item,
+            dict,
+        ):
+            continue
+
+        kind = _clean_text(
+            item.get("kind")
+        ).lower()
+
+        content = _clean_text(
+            item.get("content")
+        )
+
+        title = _clean_text(
+            item.get("title")
+        )
+
+        if kind not in {
+            "topic",
+            "explanation",
+            "action",
+        }:
+            continue
+
+        if not content:
+            continue
+
+        # Protect against AI returning compound actions.
+        if kind == "action":
+            pieces = _split_compound_action(
+                content
+            )
+
+            for piece in pieces:
+                if not _is_bad_segment(
+                    piece
+                ):
+                    output.append(
+                        {
+                            "kind": "action",
+                            "title": piece,
+                            "content": piece,
+                        }
+                    )
+        else:
+            output.append(
+                {
+                    "kind": kind,
+                    "title": title or content,
+                    "content": content,
+                }
+            )
+
+    return output
+
+
+# ----------------------------------------------------------------------
+# PAGE ASSOCIATION
+# ----------------------------------------------------------------------
+
+def _page_text(
+    page: Any,
+) -> str:
+    if isinstance(page, str):
+        return _clean_text(page)
+
+    if not isinstance(page, dict):
+        return ""
+
+    for key in (
+        "text",
+        "content",
+        "document_text",
+        "page_text",
+    ):
+        value = page.get(key)
+
+        if value:
+            return _clean_text(value)
+
+    return ""
+
+
+def _page_number(
+    page: Any,
+    fallback: int,
+) -> Optional[int]:
+    if isinstance(page, dict):
+        for key in (
+            "page",
+            "page_number",
+            "number",
+        ):
+            value = page.get(key)
+
+            if isinstance(
+                value,
+                int,
+            ):
+                return value
+
+            if isinstance(
+                value,
+                str,
+            ):
+                try:
+                    return int(value)
+                except Exception:
+                    pass
+
+    return fallback
+
+
+def _tokens(text: str) -> set:
+    text = _remove_urls(
+        text.lower()
+    )
+
+    return {
+        token
+        for token in re.findall(
+            r"[a-z0-9]+",
+            text,
+        )
+        if len(token) >= 3
+    }
+
+
+def _page_for_segment(
+    segment: Dict[str, Any],
+    pages: List[Any],
+    previous_page: Optional[int] = None,
+) -> Optional[int]:
+    explicit = segment.get(
+        "source_page"
+    )
+
+    if isinstance(
+        explicit,
+        int,
+    ):
+        return explicit
+
+    content = _clean_text(
+        segment.get("content")
+    )
+
+    if not content or not pages:
+        return previous_page
+
+    source_tokens = _tokens(
+        content
+    )
+
+    if not source_tokens:
+        return previous_page
+
+    best_page = None
+    best_score = 0.0
+
+    for index, page in enumerate(
+        pages,
+        start=1,
+    ):
+        text = _page_text(page)
+
+        if not text:
+            continue
+
+        page_tokens = _tokens(
+            text
+        )
+
+        if not page_tokens:
+            continue
+
+        overlap = len(
+            source_tokens
+            & page_tokens
+        )
+
+        if overlap == 0:
+            continue
+
+        score = overlap / max(
+            1,
+            len(source_tokens),
+        )
+
+        # Small preference for the current/previous page.
+        page_number = _page_number(
+            page,
+            index,
+        )
+
+        if (
+            previous_page is not None
+            and page_number == previous_page
+        ):
+            score += 0.08
+
+        if score > best_score:
+            best_score = score
+            best_page = page_number
+
+    return (
+        best_page
+        if best_page is not None
+        else previous_page
+    )
+
+
+# ----------------------------------------------------------------------
+# SCREENSHOTS
+# ----------------------------------------------------------------------
+
+def _normalise_screenshots(
+    screenshots: List[Any],
+) -> List[Dict[str, Any]]:
+    result = []
+
+    for item in screenshots:
+        if isinstance(
+            item,
+            str,
+        ):
+            result.append(
+                {
+                    "path": item,
+                    "page": None,
+                }
+            )
+            continue
+
+        if not isinstance(
+            item,
+            dict,
+        ):
+            continue
+
+        path = (
+            item.get("path")
+            or item.get("file")
+            or item.get("screenshot")
+        )
+
+        if not path:
+            continue
+
+        page = (
+            item.get("page")
+            or item.get("source_page")
+            or item.get("page_number")
+        )
+
+        if isinstance(
+            page,
+            str,
+        ):
+            try:
+                page = int(page)
+            except Exception:
+                page = None
+
+        result.append(
+            {
+                "path": path,
+                "page": page,
+            }
+        )
+
+    return result
+
+
+def _choose_screenshot(
+    screenshots: List[Dict[str, Any]],
+    source_page: Optional[int],
+    action: str,
+) -> Optional[Dict[str, Any]]:
+    if not screenshots:
         return None
+
+    # Best case: same page.
+    if source_page is not None:
+        same_page = [
+            item
+            for item in screenshots
+            if item.get("page")
+            == source_page
+        ]
+
+        if same_page:
+            return same_page[0]
+
+    # Otherwise nearest screenshot page.
+    if source_page is not None:
+        candidates = [
+            item
+            for item in screenshots
+            if isinstance(
+                item.get("page"),
+                int,
+            )
+        ]
+
+        if candidates:
+            return min(
+                candidates,
+                key=lambda item: abs(
+                    item["page"]
+                    - source_page
+                ),
+            )
+
+    return screenshots[0]
+
+
+# ----------------------------------------------------------------------
+# VISION
+# ----------------------------------------------------------------------
+
+def _target_query(
+    action: str,
+) -> str:
+    action = _remove_urls(
+        action
+    )
+
+    action = re.sub(
+        r"\s+as shown below\.?$",
+        "",
+        action,
+        flags=re.IGNORECASE,
+    )
+
+    return _clean_text(
+        action
+    )
+
+
+def _vision_target(
+    screenshot_path: Optional[str],
+    action: str,
+) -> Dict[str, Any]:
+    empty = {
+        "found": False,
+        "target_name": "",
+        "click_point": None,
+        "bounding_box": None,
+        "confidence": 0.0,
+    }
+
+    if not screenshot_path:
+        return empty
+
+    if not VISION_ENABLED:
+        return empty
+
     try:
         result = analyze_image(
-            screenshot["path"],
-            context=(
-                f"Action: {step.get('title','')}. Find the exact visible interactive control where the action happens. "
-                "Return its bounding box and confidence."
-            ),
-            timeout=VISION_TIMEOUT,
+            screenshot_path,
+            _target_query(action),
         )
-        pos = result.get("approximate_position") or {}
-        conf = float(result.get("confidence", 0) or 0)
-        if conf < VISION_MIN_CONFIDENCE or not isinstance(pos, dict):
-            return None
-        x = float(pos.get("x")); y = float(pos.get("y"))
-        w = float(pos.get("width", 0) or 0); h = float(pos.get("height", 0) or 0)
-        if w:
-            x += w / 2
-        if h:
-            y += h / 2
-        if not (0 <= x <= 1 and 0 <= y <= 1):
-            return None
-        return {"cursor": (x, y), "confidence": conf, "target": _clean(result.get("target_name", ""))}
     except Exception as exc:
-        print(f"[VISION] target failed: {exc}")
-        return None
+        print(
+            f"[VISION] error: {exc}"
+        )
+        return empty
 
+    if not isinstance(
+        result,
+        dict,
+    ):
+        return empty
 
-def _fallback_cursor(screenshot, step):
-    """Generic visual fallback: pick a large UI-like region, never a document page."""
-    if not screenshot:
-        return None
+    found = bool(
+        result.get("found")
+    )
+
     try:
-        from PIL import Image, ImageChops, ImageFilter, ImageStat
-        import cv2
-        import numpy as np
-
-        image = cv2.imread(str(screenshot["path"]))
-        if image is None:
-            return None
-        h, w = image.shape[:2]
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        edges = cv2.Canny(gray, 60, 160)
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        candidates = []
-        action = _clean(step.get("title", "")).lower()
-        text_like = any(k in action for k in ("enter", "type", "fill", "input", "password", "username"))
-        for c in contours:
-            x, y, cw, ch = cv2.boundingRect(c)
-            area = cw * ch
-            if area < w * h * 0.008 or cw < 60 or ch < 18:
-                continue
-            if cw > w * 0.9 and ch > h * 0.35:
-                continue
-            ratio = cw / max(1, ch)
-            if text_like and not (ratio >= 2.2 and ch <= h * 0.15):
-                continue
-            if not text_like and not (0.7 <= ratio <= 8.0):
-                continue
-            candidates.append((area, (x + cw / 2, y + ch / 2)))
-        if not candidates:
-            return (0.50, 0.50)
-        candidates.sort(reverse=True)
-        cx, cy = candidates[0][1]
-        return (cx / w, cy / h)
+        confidence = float(
+            result.get(
+                "confidence",
+                0.0,
+            )
+            or 0.0
+        )
     except Exception:
-        return (0.50, 0.50)
+        confidence = 0.0
 
-
-def _fallback_narration(title):
-    return f"{_clean(title)}."
-
-
-def _ai_narration(actions, pages):
-    if not (OLLAMA_NARRATION_ENABLED and actions):
-        return {}
-    pm = _page_map(pages)
-    units = []
-    for x in actions:
-        p = pm.get(x.get("source_page"))
-        txt = _clean(p.get("text", ""))[:700] if p else ""
-        units.append(f"STEP {x['number']}: {x['title']}\nSOURCE PAGE: {x.get('source_page')}\nPAGE CONTEXT: {txt}")
-    prompt = f"""
-Create concise professional English narration for each software training step.
-Each narration MUST state the action.
-Add one short purpose clause ONLY when the supplied source context clearly gives a purpose or reason.
-Do not read or summarize the rest of the document.
-Maximum 24 words per narration.
-Keep UI labels exactly as written.
-Return ONLY JSON: {{"steps":[{{"id":1,"narration":"..."}}]}}
-
-{chr(10).join(units)[:12000]}
-"""
-    try:
-        data = _ollama(prompt, timeout=OLLAMA_TIMEOUT, num_predict=min(500, max(180, len(actions) * 24)), temperature=0.0)
+    if not found:
         return {
-            int(x["id"]): _clean(x.get("narration", ""))
-            for x in data.get("steps", [])
-            if isinstance(x, dict) and str(x.get("id", "")).isdigit()
+            "found": False,
+            "target_name": _clean_text(
+                result.get("target_name")
+            ),
+            "click_point": None,
+            "bounding_box": result.get(
+                "bounding_box"
+            ),
+            "confidence": confidence,
         }
-    except Exception as exc:
-        print(f"[AI] concise narration unavailable; using deterministic narration: {exc}")
-        return {}
 
+    click_point = result.get(
+        "click_point"
+    )
 
-def build_tutorial_plan(data, narration_language="en-us", progress_callback=None):
-    pages = list((data or {}).get("pages", []) or []) if isinstance(data, dict) else []
-    screenshots = list((data or {}).get("screenshots", []) or []) if isinstance(data, dict) else []
-    document_text = str((data or {}).get("text", "")) if isinstance(data, dict) else str(data or "")
+    bbox = result.get(
+        "bounding_box"
+    )
 
-    def report(p, message):
-        if progress_callback:
-            progress_callback(p, message)
+    if not (
+        isinstance(
+            click_point,
+            (list, tuple),
+        )
+        and len(click_point) == 2
+    ):
+        return {
+            "found": False,
+            "target_name": _clean_text(
+                result.get("target_name")
+            ),
+            "click_point": None,
+            "bounding_box": bbox,
+            "confidence": confidence,
+        }
 
-    report(30, "Identifying procedure steps")
-    actions = _numbered_steps(pages) or _action_heuristic(pages) or _ai_extract_actions(pages)
-    if not actions:
-        raise ValueError("No actionable procedure steps could be identified in the uploaded PDF.")
+    if confidence < VISION_MIN_CONFIDENCE:
+        print(
+            f"[VISION] low confidence "
+            f"{confidence:.2f}: {action}"
+        )
 
-    report(34, f"Found {len(actions)} procedure steps")
-    report(36, "Generating concise English narration")
-    narr = _ai_narration(actions, pages)
+        return {
+            "found": False,
+            "target_name": _clean_text(
+                result.get("target_name")
+            ),
+            "click_point": None,
+            "bounding_box": bbox,
+            "confidence": confidence,
+        }
 
-    report(39, "Finding screenshots and cursor targets")
-    final = []
-    pm = _page_map(pages)
+    try:
+        x = max(
+            0.0,
+            min(
+                1.0,
+                float(click_point[0]),
+            ),
+        )
 
-    for idx, action in enumerate(actions, 1):
-        shot = _choose_screenshot(action, screenshots, pages)
-        page = pm.get(action.get("source_page"))
-        cursor = None
-        target = ""
-        conf = 0.0
+        y = max(
+            0.0,
+            min(
+                1.0,
+                float(click_point[1]),
+            ),
+        )
+    except Exception:
+        return {
+            "found": False,
+            "target_name": "",
+            "click_point": None,
+            "bounding_box": bbox,
+            "confidence": confidence,
+        }
 
-        text_target = _find_text_target(action, page)
-        if text_target and shot:
-            cursor = _page_cursor_to_screenshot(text_target, shot, page)
-            if cursor:
-                target = text_target[2]
-                conf = 0.70
-
-        if shot and cursor is None:
-            vision = _vision_target(action, shot)
-            if vision:
-                cursor = vision["cursor"]
-                target = vision["target"]
-                conf = vision["confidence"]
-
-        if shot and cursor is None:
-            cursor = _fallback_cursor(shot, action)
-            target = target or _target_query(action.get("title", ""))
-            conf = 0.25
-
-        narration = narr.get(idx) or _fallback_narration(action["title"])
-        final.append({
-            "id": idx,
-            "kind": "action",
-            "number": idx,
-            "title": _clean(action["title"]),
-            "narration": narration,
-            "tts_narration": narration,
-            "caption": narration,
-            "screenshot": shot.get("path") if isinstance(shot, dict) else None,
-            "screenshot_page": shot.get("page") if isinstance(shot, dict) else None,
-            "source_page": action.get("source_page"),
-            "cursor": cursor,
-            "actions": [{"type": "guided_cursor", "target": cursor}],
-            "visual_type": shot.get("source_type", "none") if isinstance(shot, dict) else "none",
-            "visual_target": target,
-            "visual_confidence": conf,
-        })
-        report(39 + int(9 * idx / max(1, len(actions))), f"Prepared step {idx} of {len(actions)}")
-
-    report(48, "Tutorial plan ready")
-    title = _clean(next((x for x in document_text.splitlines() if 4 <= len(_clean(x)) <= 100), "AI Learning Tutorial"))
     return {
-        "title": title or "AI Learning Tutorial",
-        "description": "Concise English action tutorial using the document's relevant embedded screenshots with generic cursor guidance.",
+        "found": True,
+        "target_name": _clean_text(
+            result.get(
+                "target_name"
+            )
+        ),
+        "click_point": [x, y],
+        "bounding_box": bbox,
+        "confidence": confidence,
+    }
+
+
+# ----------------------------------------------------------------------
+# NARRATION
+# ----------------------------------------------------------------------
+
+def _narration_for_segment(
+    text: str,
+    kind: str,
+) -> str:
+    text = _clean_text(
+        text
+    )
+
+    if not text:
+        return ""
+
+    urls = _extract_urls(
+        text
+    )
+
+    spoken = _remove_urls(
+        text
+    )
+
+    spoken = re.sub(
+        r"\s+as shown below\.?$",
+        "",
+        spoken,
+        flags=re.IGNORECASE,
+    )
+
+    spoken = re.sub(
+        r"\bpage\s+\d+\b",
+        "",
+        spoken,
+        flags=re.IGNORECASE,
+    )
+
+    spoken = _clean_text(
+        spoken
+    )
+
+    if not spoken and urls:
+        if kind == "action":
+            return "Open the following URL."
+
+        return ""
+
+    return spoken
+
+
+def _ai_narration(
+    text: str,
+    kind: str,
+) -> str:
+    source = _narration_for_segment(
+        text,
+        kind,
+    )
+
+    if not source:
+        return ""
+
+    # Actions should remain direct and source-grounded.
+    if kind == "action":
+        return source
+
+    # Topics should be short.
+    if kind == "topic":
+        words = source.split()
+
+        if len(words) <= 12:
+            return source
+
+        return _clean_text(
+            source
+        )
+
+    # Explanations:
+    # preserve important information but allow modest compression.
+    prompt = f"""
+Rewrite this software-training explanation for spoken narration.
+
+SOURCE:
+{source}
+
+Rules:
+
+1. Use ONLY information in the source.
+2. Do not invent anything.
+3. Preserve the important facts.
+4. Do not remove useful prerequisites, purpose, constraints,
+   or operational information.
+5. Do not elaborate.
+6. Do not add generic training language.
+7. Do not mention captions.
+8. Do not mention URLs.
+9. Do not mention page numbers.
+10. Do not say "as shown below".
+11. Do not say "in this video".
+12. Do not say "we will".
+13. Use one or two concise spoken sentences.
+14. Prefer approximately 15-55 words.
+15. If the source contains several important related points,
+    retain them compactly rather than reducing everything
+    to one vague statement.
+
+Return ONLY JSON:
+
+{{
+  "narration": "..."
+}}
+"""
+
+    result = _ollama(
+        prompt
+    )
+
+    if result:
+        narration = _clean_text(
+            result.get(
+                "narration"
+            )
+        )
+
+        if narration:
+            return narration
+
+    return source
+
+
+# ----------------------------------------------------------------------
+# CAPTIONS
+# ----------------------------------------------------------------------
+
+def _caption_for_segment(
+    text: str,
+    kind: str,
+) -> str:
+    text = _clean_text(
+        text
+    )
+
+    if kind == "topic":
+        return text
+
+    # URLs are displayed, but never narrated.
+    # Keep them in captions.
+    urls = _extract_urls(
+        text
+    )
+
+    caption = _remove_urls(
+        text
+    ).strip()
+
+    if urls:
+        if caption:
+            return (
+                f"{caption}\n"
+                + "\n".join(urls)
+            )
+
+        return "\n".join(
+            urls
+        )
+
+    return caption
+
+
+# ----------------------------------------------------------------------
+# MAIN PLAN BUILDER
+# ----------------------------------------------------------------------
+
+def build_tutorial_plan(
+    data: Dict[str, Any],
+    narration_language: str = "en-us",
+    progress_callback=None,
+) -> Dict[str, Any]:
+
+    def report(
+        progress: int,
+        message: str = "Building tutorial plan",
+    ):
+        """
+        Single callback gateway.
+
+        Supports both old and new callers.
+        """
+
+        if not progress_callback:
+            return
+
+        try:
+            progress_callback(
+                int(progress),
+                message,
+            )
+        except TypeError:
+            # Backward compatibility with callbacks
+            # accepting only progress.
+            progress_callback(
+                int(progress)
+            )
+
+    document_text = (
+        data.get("document_text")
+        or data.get("text")
+        or ""
+    )
+
+    screenshots = _normalise_screenshots(
+        data.get("screenshots") or []
+    )
+
+    pages = data.get(
+        "pages"
+    ) or []
+
+    report(
+        5,
+        "Analysing document structure",
+    )
+
+    ai_segments = _ai_extract_segments(
+        document_text
+    )
+
+    report(
+        35,
+        "Building topics, explanations and actions",
+    )
+
+    if not ai_segments:
+        print(
+            "[PLAN] LLM extraction unavailable; "
+            "using deterministic document planner"
+        )
+
+        ai_segments = _heuristic_segments(
+            document_text
+        )
+
+    if not ai_segments:
+        raise RuntimeError(
+            "Unable to create a tutorial plan from the document."
+        )
+
+    steps = []
+
+    next_id = 1
+    previous_page = None
+
+    total = len(
+        ai_segments
+    )
+
+    for index, raw_segment in enumerate(
+        ai_segments,
+        start=1,
+    ):
+        kind = _clean_text(
+            raw_segment.get(
+                "kind"
+            )
+        ).lower()
+
+        content = _clean_text(
+            raw_segment.get(
+                "content"
+            )
+        )
+
+        title = _clean_text(
+            raw_segment.get(
+                "title"
+            )
+        )
+
+        if kind not in {
+            "topic",
+            "explanation",
+            "action",
+        }:
+            continue
+
+        if _is_bad_segment(
+            content
+        ):
+            continue
+
+        source_page = _page_for_segment(
+            raw_segment,
+            pages,
+            previous_page,
+        )
+
+        if source_page is not None:
+            previous_page = source_page
+
+        if kind == "action":
+            pieces = _split_compound_action(
+                content
+            )
+        else:
+            pieces = [content]
+
+        for piece in pieces:
+            piece = _clean_text(
+                piece
+            )
+
+            if _is_bad_segment(
+                piece
+            ):
+                continue
+
+            # --------------------------------------------------
+            # Screenshot
+            # --------------------------------------------------
+
+            screenshot = _choose_screenshot(
+                screenshots,
+                source_page,
+                piece,
+            )
+
+            screenshot_path = (
+                screenshot.get("path")
+                if screenshot
+                else None
+            )
+
+            screenshot_page = (
+                screenshot.get("page")
+                if screenshot
+                else source_page
+            )
+
+            # --------------------------------------------------
+            # Visual grounding
+            # --------------------------------------------------
+
+            visual = {
+                "found": False,
+                "target_name": "",
+                "click_point": None,
+                "bounding_box": None,
+                "confidence": 0.0,
+            }
+
+            if (
+                kind == "action"
+                and screenshot_path
+            ):
+                visual = _vision_target(
+                    screenshot_path,
+                    piece,
+                )
+
+            # --------------------------------------------------
+            # Narration
+            # --------------------------------------------------
+
+            narration = _ai_narration(
+                piece,
+                kind,
+            )
+
+            caption = _caption_for_segment(
+                piece,
+                kind,
+            )
+
+            step = {
+                "id": next_id,
+                "kind": kind,
+                "number": next_id,
+
+                "title": (
+                    piece
+                    if kind == "action"
+                    else (
+                        title
+                        or piece
+                    )
+                ),
+
+                "content": piece,
+
+                "narration": narration,
+                "tts_narration": narration,
+
+                "caption": caption,
+
+                "screenshot": screenshot_path,
+
+                "screenshot_page": screenshot_page,
+
+                "source_page": source_page,
+
+                "cursor": (
+                    visual["click_point"]
+                    if visual["found"]
+                    else None
+                ),
+
+                "actions": (
+                    [
+                        {
+                            "type": "guided_cursor",
+                            "target": visual[
+                                "click_point"
+                            ],
+                            "target_name": visual[
+                                "target_name"
+                            ],
+                            "bounding_box": visual[
+                                "bounding_box"
+                            ],
+                            "confidence": visual[
+                                "confidence"
+                            ],
+                        }
+                    ]
+                    if (
+                        kind == "action"
+                        and visual["found"]
+                    )
+                    else []
+                ),
+
+                "visual_type": (
+                    "embedded_screenshot"
+                    if screenshot_path
+                    else "none"
+                ),
+
+                "visual_target": visual[
+                    "target_name"
+                ],
+
+                "visual_confidence": visual[
+                    "confidence"
+                ],
+            }
+
+            steps.append(
+                step
+            )
+
+            next_id += 1
+
+        report(
+            35 + int(
+                60
+                * (
+                    index
+                    / max(
+                        1,
+                        total,
+                    )
+                )
+            ),
+            (
+                f"Processing tutorial content "
+                f"{index}/{total}"
+            ),
+        )
+
+    # --------------------------------------------------------------
+    # Title
+    # --------------------------------------------------------------
+
+    title = "Software Training Tutorial"
+
+    for step in steps:
+        if step.get("kind") == "topic":
+            candidate = _clean_text(
+                step.get("title")
+            )
+
+            if candidate:
+                title = candidate
+                break
+
+    # Remove numbering from title where possible.
+    title = re.sub(
+        r"^\d+(?:\.\d+)*\s+",
+        "",
+        title,
+    ).strip()
+
+    if not title:
+        title = "Software Training Tutorial"
+
+    plan = {
+        "title": title,
+
+        "description": (
+            "Software training tutorial generated "
+            "from the uploaded document."
+        ),
+
         "source": "uploaded PDF",
-        "narration_language": "en-us",
-        "steps": final,
-        "screenshot_count": len(screenshots),
+
+        "narration_language": narration_language,
+
+        "steps": steps,
+
+        "screenshot_count": len(
+            screenshots
+        ),
+
         "document_text": document_text,
     }
+
+    report(
+        100,
+        (
+            f"Tutorial plan ready: "
+            f"{len(steps)} scenes"
+        ),
+    )
+
+    topic_count = sum(
+        1
+        for step in steps
+        if step.get("kind")
+        == "topic"
+    )
+
+    explanation_count = sum(
+        1
+        for step in steps
+        if step.get("kind")
+        == "explanation"
+    )
+
+    action_count = sum(
+        1
+        for step in steps
+        if step.get("kind")
+        == "action"
+    )
+
+    grounded_count = sum(
+        1
+        for step in steps
+        if (
+            step.get("kind")
+            == "action"
+            and step.get("cursor")
+            is not None
+        )
+    )
+
+    print(
+        f"[PLAN] generated {len(steps)} scenes "
+        f"({topic_count} topics, "
+        f"{explanation_count} explanations, "
+        f"{action_count} actions, "
+        f"{grounded_count} visually grounded actions)"
+    )
+
+    return plan
