@@ -1,0 +1,40 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Generated jobs and media
+jobs/
+uploads/
+media/
+*.mp4
+*.wav
+*.mp3
+*.webm
+
+# Model/cache files
+.cache/
+.cache/**
+models/
+*.bin
+*.pth
+*.pt
+*.gguf
+*.safetensors
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

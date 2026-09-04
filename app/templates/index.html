@@ -1,0 +1,1147 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1"
+    >
+
+    <title>Teamcenter AI Studio</title>
+
+    <link
+        rel="stylesheet"
+        href="/static/style.css"
+    >
+
+    <style>
+        .hidden {
+            display: none !important;
+        }
+
+        button:disabled {
+            opacity: 0.55;
+            cursor: not-allowed;
+        }
+
+        .drop.dragging {
+            border-color: #087ea4;
+            background: #f0fbff;
+        }
+
+        .video-wrap {
+            width: 100%;
+            margin-top: 20px;
+            background: #111;
+            border-radius: 12px;
+            overflow: hidden;
+        }
+
+        #vid {
+            display: block;
+            width: 100%;
+            max-width: 1200px;
+            min-height: 420px;
+            margin: 0 auto;
+            background: #111;
+            object-fit: contain;
+        }
+
+        .video-status {
+            margin-top: 12px;
+            font-size: 14px;
+            color: #666;
+        }
+
+        .video-status.success {
+            color: #16803c;
+        }
+
+        .video-status.error {
+            color: #c62828;
+        }
+
+        .stage-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-top: 16px;
+        }
+
+        .stage-list span {
+            padding: 6px 10px;
+            border-radius: 999px;
+            background: #f2f2f2;
+            font-size: 12px;
+        }
+
+        .job-info {
+            margin-top: 10px;
+            font-size: 12px;
+            color: #777;
+            word-break: break-all;
+        }
+
+        .success-box {
+            margin-top: 15px;
+            padding: 12px 14px;
+            border-radius: 8px;
+            background: #f3faf5;
+            border: 1px solid #ccebd5;
+            color: #246b39;
+            font-size: 14px;
+        }
+
+        .error-box {
+            margin-top: 15px;
+            padding: 12px 14px;
+            border-radius: 8px;
+            background: #fff5f5;
+            border: 1px solid #f1c7c7;
+            color: #a12626;
+            font-size: 14px;
+        }
+
+        #open {
+            text-decoration: none;
+        }
+
+        @media (max-width: 700px) {
+            #vid {
+                min-height: 250px;
+            }
+        }
+    </style>
+</head>
+
+<body>
+
+<div class="shell">
+
+    <!-- =====================================================
+         HEADER
+         ===================================================== -->
+
+    <header>
+        <div>
+            <small>
+                AI TRAINING VIDEO PROTOTYPE
+            </small>
+
+            <h1>
+                Teamcenter AI Studio
+            </h1>
+
+            <p>
+                Convert a procedure PDF into an English narrated
+                tutorial with captions and visual cursor guidance.
+            </p>
+        </div>
+
+        <b>
+            LOCAL • PRIVATE
+        </b>
+    </header>
+
+
+    <!-- =====================================================
+         UPLOAD CARD
+         ===================================================== -->
+
+    <section class="card">
+
+        <h2>
+            Generate tutorial
+        </h2>
+
+        <p>
+            Upload any procedure or training PDF. The system
+            extracts the document content and screenshots,
+            identifies the actions, generates English narration,
+            and creates a synchronized tutorial video.
+        </p>
+
+        <label
+            class="drop"
+            id="drop"
+        >
+
+            <input
+                id="pdf"
+                type="file"
+                accept=".pdf,application/pdf"
+            >
+
+            <strong id="name">
+                Choose a PDF
+            </strong>
+
+            <span>
+                or drag and drop
+            </span>
+
+        </label>
+
+
+        <button
+            id="go"
+            type="button"
+        >
+            Generate working tutorial
+        </button>
+
+
+        <div
+            id="err"
+            class="hidden error-box"
+        ></div>
+
+    </section>
+
+
+    <!-- =====================================================
+         PROGRESS
+         ===================================================== -->
+
+    <section
+        id="prog"
+        class="card hidden"
+    >
+
+        <div class="row">
+
+            <div>
+                <h2 id="st">
+                    Processing
+                </h2>
+
+                <p id="msg">
+                    Starting...
+                </p>
+            </div>
+
+            <strong id="pct">
+                0%
+            </strong>
+
+        </div>
+
+
+        <div class="bar">
+            <i id="fill"></i>
+        </div>
+
+
+        <div class="stage-list">
+            <span>PDF</span>
+            <span>Procedure</span>
+            <span>Screenshots</span>
+            <span>Narration</span>
+            <span>Video</span>
+        </div>
+
+
+        <div
+            id="jobInfo"
+            class="job-info"
+        ></div>
+
+    </section>
+
+
+    <!-- =====================================================
+         RESULT
+         ===================================================== -->
+
+    <section
+        id="result"
+        class="card hidden"
+    >
+
+        <div class="row">
+
+            <div>
+
+                <small>
+                    READY
+                </small>
+
+                <h2 id="title">
+                    Tutorial
+                </h2>
+
+                <p id="meta"></p>
+
+            </div>
+
+            <a
+                id="open"
+                href="#"
+                target="_blank"
+                rel="noopener"
+            >
+                Open video
+            </a>
+
+        </div>
+
+
+        <div class="success-box">
+            Tutorial generated successfully.
+        </div>
+
+
+        <div class="video-wrap">
+
+            <video
+                id="vid"
+                controls
+                playsinline
+                preload="metadata"
+            >
+                Your browser does not support HTML5 video.
+            </video>
+
+        </div>
+
+
+        <div
+            id="videoStatus"
+            class="video-status"
+        >
+            Loading generated tutorial...
+        </div>
+
+    </section>
+
+</div>
+
+
+<script>
+    // =========================================================
+    // ELEMENTS
+    // =========================================================
+
+    const pdfInput =
+        document.getElementById("pdf");
+
+    const fileName =
+        document.getElementById("name");
+
+    const generateButton =
+        document.getElementById("go");
+
+    const errorBox =
+        document.getElementById("err");
+
+    const progressSection =
+        document.getElementById("prog");
+
+    const resultSection =
+        document.getElementById("result");
+
+    const statusTitle =
+        document.getElementById("st");
+
+    const statusMessage =
+        document.getElementById("msg");
+
+    const percentage =
+        document.getElementById("pct");
+
+    const progressFill =
+        document.getElementById("fill");
+
+    const tutorialTitle =
+        document.getElementById("title");
+
+    const metadata =
+        document.getElementById("meta");
+
+    const video =
+        document.getElementById("vid");
+
+    const openVideo =
+        document.getElementById("open");
+
+    const videoStatus =
+        document.getElementById("videoStatus");
+
+    const dropZone =
+        document.getElementById("drop");
+
+    const jobInfo =
+        document.getElementById("jobInfo");
+
+
+    // =========================================================
+    // STATE
+    // =========================================================
+
+    let selectedFile = null;
+    let pollingTimer = null;
+
+
+    // =========================================================
+    // ERROR HANDLING
+    // =========================================================
+
+    function showError(message) {
+        errorBox.textContent = message;
+        errorBox.classList.remove("hidden");
+    }
+
+
+    function hideError() {
+        errorBox.textContent = "";
+        errorBox.classList.add("hidden");
+    }
+
+
+    // =========================================================
+    // PDF VALIDATION
+    // =========================================================
+
+    function isPdf(file) {
+
+        if (!file) {
+            return false;
+        }
+
+        return (
+            file.type === "application/pdf" ||
+            file.name.toLowerCase().endsWith(".pdf")
+        );
+    }
+
+
+    function selectFile(file) {
+
+        if (!isPdf(file)) {
+
+            selectedFile = null;
+
+            fileName.textContent =
+                "Choose a PDF";
+
+            showError(
+                "Please select a valid PDF file."
+            );
+
+            return;
+        }
+
+        selectedFile = file;
+
+        fileName.textContent =
+            file.name;
+
+        hideError();
+    }
+
+
+    // =========================================================
+    // FILE INPUT
+    // =========================================================
+
+    pdfInput.addEventListener(
+        "change",
+        function () {
+
+            const file =
+                this.files && this.files[0];
+
+            selectFile(file);
+
+        }
+    );
+
+
+    // =========================================================
+    // DRAG AND DROP
+    // =========================================================
+
+    ["dragenter", "dragover"].forEach(
+        eventName => {
+
+            dropZone.addEventListener(
+                eventName,
+                event => {
+
+                    event.preventDefault();
+                    event.stopPropagation();
+
+                    dropZone.classList.add(
+                        "dragging"
+                    );
+                }
+            );
+        }
+    );
+
+
+    ["dragleave", "drop"].forEach(
+        eventName => {
+
+            dropZone.addEventListener(
+                eventName,
+                event => {
+
+                    event.preventDefault();
+                    event.stopPropagation();
+
+                    dropZone.classList.remove(
+                        "dragging"
+                    );
+                }
+            );
+        }
+    );
+
+
+    dropZone.addEventListener(
+        "drop",
+        event => {
+
+            const files =
+                event.dataTransfer.files;
+
+            if (
+                files &&
+                files.length
+            ) {
+                selectFile(files[0]);
+            }
+        }
+    );
+
+
+    // =========================================================
+    // PROGRESS
+    // =========================================================
+
+    function setProgress(
+        value,
+        message,
+        title
+    ) {
+
+        const safeValue =
+            Math.max(
+                0,
+                Math.min(
+                    100,
+                    Number(value) || 0
+                )
+            );
+
+        percentage.textContent =
+            Math.round(safeValue) + "%";
+
+        progressFill.style.width =
+            safeValue + "%";
+
+
+        if (message) {
+            statusMessage.textContent =
+                message;
+        }
+
+
+        if (title) {
+            statusTitle.textContent =
+                title;
+        }
+    }
+
+
+    // =========================================================
+    // STAGE
+    // =========================================================
+
+    function getStageTitle(
+        status,
+        progress
+    ) {
+
+        const value =
+            String(
+                status || ""
+            ).toLowerCase();
+
+
+        if (
+            value.includes("extract")
+        ) {
+            return "Extracting PDF";
+        }
+
+
+        if (
+            value.includes("procedure") ||
+            value.includes("step") ||
+            value.includes("plan") ||
+            value.includes("ai")
+        ) {
+            return "Building tutorial";
+        }
+
+
+        if (
+            value.includes("screenshot") ||
+            value.includes("visual")
+        ) {
+            return "Processing screenshots";
+        }
+
+
+        if (
+            value.includes("narr")
+        ) {
+            return "Generating narration";
+        }
+
+
+        if (
+            value.includes("video") ||
+            value.includes("render")
+        ) {
+            return "Rendering video";
+        }
+
+
+        if (progress < 25) {
+            return "Extracting PDF";
+        }
+
+
+        if (progress < 45) {
+            return "Building tutorial";
+        }
+
+
+        if (progress < 65) {
+            return "Generating narration";
+        }
+
+
+        if (progress < 100) {
+            return "Rendering video";
+        }
+
+
+        return "Tutorial ready";
+    }
+
+
+    // =========================================================
+    // GENERATE
+    // =========================================================
+
+    generateButton.addEventListener(
+        "click",
+        startGeneration
+    );
+
+
+    async function startGeneration() {
+
+        hideError();
+
+
+        if (!selectedFile) {
+
+            showError(
+                "Please choose a PDF first."
+            );
+
+            return;
+        }
+
+
+        if (pollingTimer) {
+
+            clearTimeout(
+                pollingTimer
+            );
+
+            pollingTimer = null;
+        }
+
+
+        resultSection.classList.add(
+            "hidden"
+        );
+
+        progressSection.classList.remove(
+            "hidden"
+        );
+
+
+        generateButton.disabled =
+            true;
+
+        generateButton.textContent =
+            "Generating...";
+
+
+        video.pause();
+
+        video.removeAttribute(
+            "src"
+        );
+
+        video.load();
+
+
+        videoStatus.textContent =
+            "Starting tutorial generation...";
+
+        videoStatus.className =
+            "video-status";
+
+
+        jobInfo.textContent = "";
+
+
+        setProgress(
+            2,
+            "Uploading PDF...",
+            "Uploading"
+        );
+
+
+        const form =
+            new FormData();
+
+        form.append(
+            "file",
+            selectedFile
+        );
+
+
+        try {
+
+            const response =
+                await fetch(
+                    "/generate",
+                    {
+                        method: "POST",
+                        body: form
+                    }
+                );
+
+
+            const data =
+                await response.json();
+
+
+            if (!response.ok) {
+
+                throw new Error(
+                    data.error ||
+                    "Failed to start generation."
+                );
+            }
+
+
+            if (!data.job_id) {
+
+                throw new Error(
+                    "Server did not return a job ID."
+                );
+            }
+
+
+            jobInfo.textContent =
+                "Job ID: " + data.job_id;
+
+
+            setProgress(
+                5,
+                "PDF uploaded. Processing started...",
+                "Processing"
+            );
+
+
+            pollStatus(
+                data.job_id
+            );
+
+
+        } catch (error) {
+
+            console.error(
+                "Generation error:",
+                error
+            );
+
+
+            showError(
+                error.message ||
+                "Unable to start generation."
+            );
+
+
+            progressSection.classList.add(
+                "hidden"
+            );
+
+
+            generateButton.disabled =
+                false;
+
+            generateButton.textContent =
+                "Generate working tutorial";
+        }
+    }
+
+
+    // =========================================================
+    // STATUS POLLING
+    // =========================================================
+
+    function pollStatus(jobId) {
+
+        if (pollingTimer) {
+
+            clearTimeout(
+                pollingTimer
+            );
+        }
+
+
+        async function check() {
+
+            try {
+
+                const response =
+                    await fetch(
+                        "/status/" +
+                        encodeURIComponent(jobId),
+                        {
+                            method: "GET",
+                            cache: "no-store"
+                        }
+                    );
+
+
+                const data =
+                    await response.json();
+
+
+                if (!response.ok) {
+
+                    throw new Error(
+                        data.error ||
+                        "Unable to read job status."
+                    );
+                }
+
+
+                const progress =
+                    Number(
+                        data.progress || 0
+                    );
+
+
+                setProgress(
+                    progress,
+                    data.message ||
+                    "Processing...",
+                    getStageTitle(
+                        data.message ||
+                        data.status,
+                        progress
+                    )
+                );
+
+
+                console.log(
+                    "[JOB STATUS]",
+                    data
+                );
+
+
+                // -------------------------------------------------
+                // FAILURE
+                // -------------------------------------------------
+
+                if (
+                    data.status === "error" ||
+                    data.status === "failed"
+                ) {
+
+                    throw new Error(
+                        data.error ||
+                        data.message ||
+                        "Tutorial generation failed."
+                    );
+                }
+
+
+                // -------------------------------------------------
+                // COMPLETE
+                // -------------------------------------------------
+
+                if (
+                    data.status === "completed" ||
+                    data.status === "complete" ||
+                    data.status === "done" ||
+                    data.status === "ready" ||
+                    data.video_url ||
+                    data.video
+                ) {
+
+                    await showResult(
+                        data,
+                        jobId
+                    );
+
+                    return;
+                }
+
+
+                pollingTimer =
+                    setTimeout(
+                        check,
+                        1000
+                    );
+
+
+            } catch (error) {
+
+                console.error(
+                    "Status error:",
+                    error
+                );
+
+
+                showError(
+                    error.message ||
+                    "An error occurred while processing the tutorial."
+                );
+
+
+                progressSection.classList.add(
+                    "hidden"
+                );
+
+
+                generateButton.disabled =
+                    false;
+
+                generateButton.textContent =
+                    "Generate working tutorial";
+
+
+                pollingTimer = null;
+            }
+        }
+
+
+        check();
+    }
+
+
+    // =========================================================
+    // RESULT
+    // =========================================================
+
+    async function showResult(
+        data,
+        jobId
+    ) {
+
+        setProgress(
+            100,
+            "Tutorial generation complete.",
+            "Tutorial ready"
+        );
+
+
+        let videoUrl =
+            data.video_url ||
+            data.video ||
+            data.url ||
+            null;
+
+
+        if (!videoUrl) {
+
+            videoUrl =
+                "/media/" +
+                encodeURIComponent(jobId) +
+                "/tutorial.mp4";
+        }
+
+
+        if (
+            typeof videoUrl === "string" &&
+            videoUrl.startsWith("/")
+        ) {
+
+            videoUrl +=
+                (
+                    videoUrl.includes("?")
+                        ? "&"
+                        : "?"
+                ) +
+                "t=" +
+                Date.now();
+        }
+
+
+        tutorialTitle.textContent =
+            data.title ||
+            "Working Tutorial";
+
+
+        metadata.textContent =
+            data.message ||
+            "Generated from the uploaded PDF with embedded screenshots, English narration, captions, and visual cursor guidance.";
+
+
+        resultSection.classList.remove(
+            "hidden"
+        );
+
+
+        openVideo.href =
+            videoUrl;
+
+
+        videoStatus.textContent =
+            "Loading generated tutorial video...";
+
+        videoStatus.className =
+            "video-status";
+
+
+        video.pause();
+
+        video.removeAttribute(
+            "src"
+        );
+
+        video.load();
+
+
+        await new Promise(
+            resolve =>
+                setTimeout(
+                    resolve,
+                    100
+                )
+        );
+
+
+        video.src =
+            videoUrl;
+
+        video.load();
+
+
+        video.onloadedmetadata =
+            function () {
+
+                videoStatus.textContent =
+                    "Video ready • " +
+                    formatDuration(
+                        video.duration
+                    );
+
+                videoStatus.className =
+                    "video-status success";
+            };
+
+
+        video.oncanplay =
+            function () {
+
+                videoStatus.textContent =
+                    "Video ready to play.";
+
+                videoStatus.className =
+                    "video-status success";
+            };
+
+
+        video.onerror =
+            function () {
+
+                console.error(
+                    "VIDEO LOAD ERROR",
+                    video.error
+                );
+
+
+                videoStatus.textContent =
+                    "The tutorial was generated, but the browser could not load the MP4. Use 'Open video' above.";
+
+                videoStatus.className =
+                    "video-status error";
+            };
+
+
+        generateButton.disabled =
+            false;
+
+        generateButton.textContent =
+            "Generate another tutorial";
+
+    }
+
+
+    // =========================================================
+    // DURATION
+    // =========================================================
+
+    function formatDuration(seconds) {
+
+        if (
+            !Number.isFinite(seconds)
+        ) {
+            return "";
+        }
+
+
+        const total =
+            Math.round(seconds);
+
+
+        const minutes =
+            Math.floor(
+                total / 60
+            );
+
+
+        const secs =
+            total % 60;
+
+
+        return (
+            minutes +
+            ":" +
+            String(secs).padStart(
+                2,
+                "0"
+            )
+        );
+    }
+
+
+    // =========================================================
+    // INITIAL STATE
+    // =========================================================
+
+    setProgress(
+        0,
+        "Choose a PDF to begin.",
+        "Ready"
+    );
+
+</script>
+
+</body>
+</html>
