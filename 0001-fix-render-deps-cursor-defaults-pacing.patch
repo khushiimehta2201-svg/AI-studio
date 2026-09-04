@@ -1,0 +1,736 @@
+From e2573888f2bb9dd325cc8f20890d72b281e39bf7 Mon Sep 17 00:00:00 2001
+From: Claude <assistant@example.com>
+Date: Fri, 4 Sep 2026 10:00:55 +0000
+Subject: [PATCH] Fix render-blocking deps, cursor/SAPI defaults, screenshot
+ grounding, scene pacing, tests
+
+- requirements.txt: add opencv-python + numpy (video_service.py imports
+  cv2/numpy but neither was declared; a clean install could not render
+  video at all). Drop unused pyttsx3.
+- .env.example: OLLAMA_VISION_ENABLED=true and TTS_PROVIDER=sapi by
+  default, matching the actual product requirement (cursor grounding
+  + Windows SAPI narration). Removed documentation for azure/auto/
+  local_hinglish TTS providers since tts_service._generate_one() does
+  not implement them in this branch -- setting them previously fell
+  back to Kokoro silently.
+- tts_service.py: hardcoded fallback default changed from kokoro to
+  sapi so behavior is correct even with no .env file present.
+- ai_service.py: _select_screenshot_and_visual() replaces the old
+  behavior of always reusing the first screenshot found on a step's
+  page. For actions, it now grounds against every same-page
+  screenshot candidate and keeps whichever one Qwen actually finds
+  the control in. Also fixes compound-action splitting leaving later
+  pieces lowercase mid-sentence in captions.
+- video_service.py: added MIN_SCENE_SECONDS floor + SCENE_PADDING_SECONDS
+  so short narration clips (e.g. "Click Save.") can't produce a scene
+  too short to show the cursor animation or let a viewer read the
+  caption.
+- tests/test_core.py: rewritten against the functions that actually
+  exist today (previous suite failed at import/collection -- it
+  referenced three functions removed in an earlier refactor). Added
+  coverage for the screenshot-grounding fix and the duration floor.
+---
+ .env.example                  |  47 ++----
+ app/services/ai_service.py    | 160 ++++++++++++++------
+ app/services/tts_service.py   |   2 +-
+ app/services/video_service.py |  44 ++++--
+ requirements.txt              |   3 +-
+ tests/test_core.py            | 270 ++++++++++++++++++++--------------
+ 6 files changed, 323 insertions(+), 203 deletions(-)
+
+diff --git a/.env.example b/.env.example
+index 704b99b..6223b26 100644
+--- a/.env.example
++++ b/.env.example
+@@ -8,39 +8,24 @@ OLLAMA_NARRATION_ENABLED=true
+ # Existing local Ollama vision model
+ OLLAMA_URL=http://127.0.0.1:11434/api/generate
+ OLLAMA_VISION_MODEL=qwen2.5vl:7b
+-# Disabled by default on 4 GB GPUs. Enable only after installing a smaller vision model.
+-OLLAMA_VISION_ENABLED=false
++# Cursor grounding is a core requirement -- keep this ON.
++# Only set to false as a temporary fallback on very low VRAM hardware.
++OLLAMA_VISION_ENABLED=true
+ OLLAMA_VISION_TIMEOUT=45
+ OLLAMA_VISION_MAX_IMAGES=12
+ OLLAMA_VISION_MIN_CONFIDENCE=0.70
+ 
+-# Production Hinglish TTS
+-TTS_PROVIDER=kokoro
+-AZURE_SPEECH_KEY=
+-AZURE_SPEECH_REGION=
+-AZURE_SPEECH_VOICE=hi-IN-SwaraNeural
+-AZURE_SPEECH_TIMEOUT=60
++# Narration backend.
++# NOTE: tts_service.py currently only implements two real backends:
++#   sapi   -> Windows SAPI via PowerShell/System.Speech (this project's default)
++#   kokoro -> local Kokoro-82M model (needs espeak-ng + model download)
++# "azure", "auto", and "local_hinglish" are referenced in README/CHANGES.md
++# but are NOT wired into tts_service._generate_one() in this branch -- setting
++# them here will silently fall back to Kokoro. Implement those backends for
++# real before relying on them, or keep using sapi.
++TTS_PROVIDER=sapi
+ 
+-# Legacy local TTS option:
+-# TTS_PROVIDER=sapi
+-# Or use TTS_PROVIDER=auto to prefer Azure when credentials exist.
+-
+-# Optional local Hinglish TTS demo backend (IndicF5 via hinglish-tts).
+-# Keep this backend in a separate Python 3.10/3.11 venv.
+-# Demo-only until commercial licensing is cleared.
+-# TTS_PROVIDER=local_hinglish
+-# HINGLISH_TTS_REPO=C:\path\to\hinglish-tts
+-# HINGLISH_REF_AUDIO=C:\path\to\hinglish-tts\data\reference_audio\tc_narrator.wav
+-# HINGLISH_REF_TEXT=C:\path\to\hinglish-tts\data\reference_audio\tc_narrator.txt
+-# HINGLISH_PYTHON=C:\path\to\hinglish-tts-venv\Scripts\python.exe
+-# HINGLISH_TTS_TIMEOUT=120
+-# HF_TOKEN=YOUR_HUGGINGFACE_READ_TOKEN
+-
+-
+-# Local Kokoro showcase backend (Apache 2.0)
+-# Select explicitly; it is intentionally not part of TTS_PROVIDER=auto.
+-# TTS_PROVIDER=kokoro
+-KOKORO_LANGUAGE=hinglish
+-KOKORO_VOICE=hf_alpha
+-# Supported UI languages: hinglish, hi, en-us, en-gb, es, fr, it, ja, pt-br, zh
+-# The web UI overrides KOKORO_LANGUAGE/KOKORO_VOICE per generation when Kokoro is selected.
++# Optional local Kokoro showcase backend (Apache 2.0) -- only used when
++# TTS_PROVIDER=kokoro above.
++KOKORO_LANGUAGE=en-us
++KOKORO_VOICE=af_heart
+diff --git a/app/services/ai_service.py b/app/services/ai_service.py
+index 0853e99..fa04126 100644
+--- a/app/services/ai_service.py
++++ b/app/services/ai_service.py
+@@ -2,7 +2,7 @@ import json
+ import os
+ import re
+ from difflib import SequenceMatcher
+-from typing import Any, Dict, List, Optional
++from typing import Any, Dict, List, Optional, Tuple
+ 
+ import requests
+ 
+@@ -436,6 +436,13 @@ def _split_compound_action(
+         if not piece.endswith("."):
+             piece += "."
+ 
++        # Splitting a compound sentence leaves later pieces starting
++        # mid-sentence in lowercase (e.g. "select ITL Design Part...").
++        # Capitalize so each piece reads as its own sentence in
++        # captions/narration.
++        if piece and piece[0].islower():
++            piece = piece[0].upper() + piece[1:]
++
+         result.append(piece)
+ 
+     return result
+@@ -944,47 +951,68 @@ def _normalise_screenshots(
+     return result
+ 
+ 
+-def _choose_screenshot(
++def _candidate_screenshots(
+     screenshots: List[Dict[str, Any]],
+     source_page: Optional[int],
+-    action: str,
+-) -> Optional[Dict[str, Any]]:
++) -> List[Dict[str, Any]]:
++    """
++    All screenshots worth considering for a step, ordered by
++    relevance. Same-page screenshots first (in on-page order),
++    since a page can contain several distinct screenshot regions
++    for different steps.
++    """
+     if not screenshots:
+-        return None
++        return []
+ 
+-    # Best case: same page.
+     if source_page is not None:
+         same_page = [
+             item
+             for item in screenshots
+-            if item.get("page")
+-            == source_page
++            if item.get("page") == source_page
+         ]
+ 
+         if same_page:
+-            return same_page[0]
++            return sorted(
++                same_page,
++                key=lambda item: item.get(
++                    "screenshot_index_on_page", 0
++                ),
++            )
+ 
+-    # Otherwise nearest screenshot page.
+-    if source_page is not None:
+-        candidates = [
++        numbered = [
+             item
+             for item in screenshots
+-            if isinstance(
+-                item.get("page"),
+-                int,
+-            )
++            if isinstance(item.get("page"), int)
+         ]
+ 
+-        if candidates:
+-            return min(
+-                candidates,
+-                key=lambda item: abs(
+-                    item["page"]
+-                    - source_page
++        if numbered:
++            nearest_page = min(
++                (item["page"] for item in numbered),
++                key=lambda page: abs(page - source_page),
++            )
++            return sorted(
++                (
++                    item
++                    for item in numbered
++                    if item["page"] == nearest_page
++                ),
++                key=lambda item: item.get(
++                    "screenshot_index_on_page", 0
+                 ),
+             )
+ 
+-    return screenshots[0]
++    return [screenshots[0]]
++
++
++def _choose_screenshot(
++    screenshots: List[Dict[str, Any]],
++    source_page: Optional[int],
++    action: str,
++) -> Optional[Dict[str, Any]]:
++    candidates = _candidate_screenshots(
++        screenshots, source_page
++    )
++    return candidates[0] if candidates else None
+ 
+ 
+ # ----------------------------------------------------------------------
+@@ -1010,6 +1038,61 @@ def _target_query(
+     )
+ 
+ 
++def _select_screenshot_and_visual(
++    screenshots: List[Dict[str, Any]],
++    source_page: Optional[int],
++    piece: str,
++    kind: str,
++) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
++    """
++    Pick the right screenshot for a step. For actions on a page with
++    several candidate screenshots, ground the action against EACH
++    candidate and keep whichever one Qwen actually finds the control
++    in (highest confidence wins), instead of always reusing the first
++    screenshot on the page regardless of which region the action's
++    target is actually in.
++    """
++    empty_visual = {
++        "found": False,
++        "target_name": "",
++        "click_point": None,
++        "bounding_box": None,
++        "confidence": 0.0,
++    }
++
++    candidates = _candidate_screenshots(
++        screenshots, source_page
++    )
++
++    if not candidates:
++        return None, empty_visual
++
++    if kind != "action" or len(candidates) == 1:
++        chosen = candidates[0]
++        visual = (
++            _vision_target(chosen.get("path"), piece)
++            if kind == "action"
++            else empty_visual
++        )
++        return chosen, visual
++
++    best_screenshot = candidates[0]
++    best_visual = empty_visual
++
++    for candidate in candidates:
++        visual = _vision_target(
++            candidate.get("path"), piece
++        )
++
++        if visual["found"] and (
++            visual["confidence"] > best_visual["confidence"]
++        ):
++            best_screenshot = candidate
++            best_visual = visual
++
++    return best_screenshot, best_visual
++
++
+ def _vision_target(
+     screenshot_path: Optional[str],
+     action: str,
+@@ -1469,13 +1552,19 @@ def build_tutorial_plan(
+                 continue
+ 
+             # --------------------------------------------------
+-            # Screenshot
++            # Screenshot + visual grounding
++            #
++            # For actions, this tries every same-page screenshot
++            # candidate and keeps the one Qwen actually grounds the
++            # control in, instead of always reusing the first
++            # screenshot found on the page.
+             # --------------------------------------------------
+ 
+-            screenshot = _choose_screenshot(
++            screenshot, visual = _select_screenshot_and_visual(
+                 screenshots,
+                 source_page,
+                 piece,
++                kind,
+             )
+ 
+             screenshot_path = (
+@@ -1490,27 +1579,6 @@ def build_tutorial_plan(
+                 else source_page
+             )
+ 
+-            # --------------------------------------------------
+-            # Visual grounding
+-            # --------------------------------------------------
+-
+-            visual = {
+-                "found": False,
+-                "target_name": "",
+-                "click_point": None,
+-                "bounding_box": None,
+-                "confidence": 0.0,
+-            }
+-
+-            if (
+-                kind == "action"
+-                and screenshot_path
+-            ):
+-                visual = _vision_target(
+-                    screenshot_path,
+-                    piece,
+-                )
+-
+             # --------------------------------------------------
+             # Narration
+             # --------------------------------------------------
+diff --git a/app/services/tts_service.py b/app/services/tts_service.py
+index e8e1b97..fb653f6 100644
+--- a/app/services/tts_service.py
++++ b/app/services/tts_service.py
+@@ -7,7 +7,7 @@ from dotenv import load_dotenv
+ 
+ load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+ 
+-TTS_PROVIDER = os.getenv("TTS_PROVIDER", "kokoro").strip().lower()
++TTS_PROVIDER = os.getenv("TTS_PROVIDER", "sapi").strip().lower()
+ 
+ # English-only configuration.
+ KOKORO_DEFAULT_LANGUAGE = "en-us"
+diff --git a/app/services/video_service.py b/app/services/video_service.py
+index 75d9f83..fbe5d63 100644
+--- a/app/services/video_service.py
++++ b/app/services/video_service.py
+@@ -639,19 +639,42 @@ def _scene_target(
+ # AUDIO / SCENE DURATION
+ # ----------------------------------------------------------------------
+ 
++# Minimum on-screen time for a scene, even when the TTS clip is very
++# short. Gives the viewer time to actually see the screenshot, watch
++# the cursor glide + click, and read the caption instead of the frame
++# flashing past. Actions get more floor than explanations because they
++# also have to fit the ~0.8s cursor-move-and-click animation.
++MIN_SCENE_SECONDS = {
++    "action": 2.6,
++    "explanation": 2.0,
++    "topic": 1.6,
++}
++
++# Extra breathing room added on top of the raw narration length so
++# pacing doesn't feel rushed even when the TTS engine speaks quickly.
++SCENE_PADDING_SECONDS = 0.5
++
++
+ def _audio_duration_for_scene(
+     scene: Dict[str, Any],
+     index: int,
+     audio_paths: List[str],
+ ) -> float:
+ 
++    kind = scene.get("kind", "action")
++    floor = MIN_SCENE_SECONDS.get(kind, 2.0)
++
+     # The most reliable mapping is a direct audio index.
+     if index < len(
+         audio_paths
+     ):
+-        return _duration(
++        raw = _duration(
+             audio_paths[index]
+         )
++        return max(
++            floor,
++            raw + SCENE_PADDING_SECONDS,
++        )
+ 
+     narration = (
+         scene.get(
+@@ -670,20 +693,17 @@ def _audio_duration_for_scene(
+             str(narration).split()
+         )
+ 
+-        return max(
+-            1.2,
+-            min(
+-                8.0,
+-                words / 2.5,
+-            ),
++        estimate = min(
++            8.0,
++            words / 2.5,
+         )
+ 
+-    if scene.get(
+-        "kind"
+-    ) == "topic":
+-        return 2.0
++        return max(
++            floor,
++            estimate + SCENE_PADDING_SECONDS,
++        )
+ 
+-    return 2.0
++    return floor
+ 
+ 
+ # ----------------------------------------------------------------------
+diff --git a/requirements.txt b/requirements.txt
+index 6559596..0e9ec8c 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -6,8 +6,9 @@ PyMuPDF==1.26.3
+ Pillow==11.3.0
+ imageio-ffmpeg==0.6.0
+ requests==2.32.4
+-pyttsx3==2.99
+ python-dotenv==1.1.1
++opencv-python==4.10.0.84
++numpy==1.26.4
+ 
+ # Optional local Kokoro TTS demo backend (Apache 2.0)
+ kokoro==0.9.4
+diff --git a/tests/test_core.py b/tests/test_core.py
+index 71f72af..7a49a18 100644
+--- a/tests/test_core.py
++++ b/tests/test_core.py
+@@ -1,135 +1,181 @@
+ from app.services.ai_service import (
+-    _extract_numbered_steps_from_pages,
+-    _fallback_visual_map,
+-    _target_center,
++    _candidate_screenshots,
++    _choose_screenshot,
++    _is_bad_segment,
++    _select_screenshot_and_visual,
++    _split_compound_action,
++)
++from app.services.video_service import (
++    MIN_SCENE_SECONDS,
++    SCENE_PADDING_SECONDS,
++    _audio_duration_for_scene,
+ )
+ 
+ 
+-def test_numbered_procedure_ignores_section_heading():
+-    pages = [{
+-        "page": 1,
+-        "text": "1. Item\nAn Item description.\nCreate Item\n1. Select Folder\n2. Click New\n3. Click Add",
+-    }]
+-    steps = _extract_numbered_steps_from_pages(pages)
+-    assert [s["title"] for s in steps] == ["Select Folder", "Click New", "Click Add"]
+-    assert all(s["source_page"] == 1 for s in steps)
+-
++# ----------------------------------------------------------------------
++# Compound action splitting
++# ----------------------------------------------------------------------
+ 
+-def test_fallback_visuals_stay_on_source_page():
+-    steps = [
+-        {"number": 1, "title": "A", "source_page": 1},
+-        {"number": 2, "title": "B", "source_page": 1},
+-        {"number": 3, "title": "C", "source_page": 1},
+-        {"number": 4, "title": "D", "source_page": 1},
+-        {"number": 5, "title": "E", "source_page": 1},
++def test_split_compound_action_separates_distinct_ui_interactions():
++    pieces = _split_compound_action(
++        "Click Add button and select ITL Design Part from drop down."
++    )
++    assert pieces == [
++        "Click Add button.",
++        "Select ITL Design Part from drop down.",
+     ]
+-    screenshots = [
+-        {"index": 0, "page": 1, "bbox": [0, 0, 100, 100], "path": "a"},
+-        {"index": 1, "page": 1, "bbox": [0, 200, 100, 300], "path": "b"},
+-        {"index": 2, "page": 2, "bbox": [0, 0, 100, 100], "path": "c"},
++
++
++def test_split_compound_action_handles_select_then_click():
++    pieces = _split_compound_action(
++        "Select the part and click Attachment tab."
++    )
++    assert pieces == [
++        "Select the part.",
++        "Click Attachment tab.",
+     ]
+-    result = _fallback_visual_map(steps, screenshots)
+-    assert result[1]["screenshot"]["page"] == 1
+-    assert result[5]["screenshot"]["page"] == 1
+-    assert result[1]["cursor"] is None
+-    assert result[5]["cursor"] is None
+ 
+ 
+-def test_invalid_target_does_not_become_center():
+-    assert _target_center({"approximate_position": {}}) is None
+-    assert _target_center({"approximate_position": {"x": "bad", "y": 0.5}}) is None
+-    assert _target_center({"approximate_position": {"x": 0.5, "y": 0.5, "width": 0.1, "height": 0.1}}) == (0.55, 0.55)
++# ----------------------------------------------------------------------
++# Fragment rejection
++# ----------------------------------------------------------------------
+ 
++def test_bare_verb_fragments_are_rejected():
++    for bad in ("Type", "Select", "Click", "Open"):
++        assert _is_bad_segment(bad)
+ 
+-def test_local_hinglish_subprocess_backend(tmp_path, monkeypatch):
+-    import sys
+-    import wave
+-    from app.services import tts_service
+-
+-    repo = tmp_path / "hinglish-tts"
+-    repo.mkdir()
+-    ref_audio = tmp_path / "ref.wav"
+-    ref_text = tmp_path / "ref.txt"
+-    output = tmp_path / "out.wav"
+-
+-    # Minimal fake CLI: proves the integration passes the expected arguments
+-    # and that the app accepts a valid PCM WAV result.
+-    (repo / "inference.py").write_text(
+-        """
+-import sys, wave
+-args = sys.argv[1:]
+-out = args[args.index('--out') + 1]
+-with wave.open(out, 'wb') as w:
+-    w.setnchannels(1)
+-    w.setsampwidth(2)
+-    w.setframerate(24000)
+-    w.writeframes(b'\\x00\\x00' * 24000)
+-""",
+-        encoding="utf-8",
++
++def test_normal_sentence_is_not_a_bad_segment():
++    assert not _is_bad_segment("Click the Filter button.")
++
++
++# ----------------------------------------------------------------------
++# Screenshot candidate selection
++# ----------------------------------------------------------------------
++
++SCREENSHOTS = [
++    {"index": 0, "page": 1, "screenshot_index_on_page": 0, "path": "p1_a.png"},
++    {"index": 1, "page": 1, "screenshot_index_on_page": 1, "path": "p1_b.png"},
++    {"index": 2, "page": 2, "screenshot_index_on_page": 0, "path": "p2_a.png"},
++]
++
++
++def test_candidate_screenshots_returns_all_same_page_regions_in_order():
++    candidates = _candidate_screenshots(SCREENSHOTS, source_page=1)
++    assert [c["path"] for c in candidates] == ["p1_a.png", "p1_b.png"]
++
++
++def test_candidate_screenshots_falls_back_to_nearest_page():
++    candidates = _candidate_screenshots(SCREENSHOTS, source_page=3)
++    assert [c["path"] for c in candidates] == ["p2_a.png"]
++
++
++def test_choose_screenshot_still_returns_a_single_best_guess():
++    chosen = _choose_screenshot(SCREENSHOTS, source_page=1, action="Click Add.")
++    assert chosen["path"] == "p1_a.png"
++
++
++def test_explanation_never_calls_vision_and_uses_first_candidate(monkeypatch):
++    # Explanations should not trigger a vision call even when several
++    # screenshots exist on the page.
++    calls = []
++
++    def fake_vision_target(path, action):
++        calls.append(path)
++        return {"found": False, "target_name": "", "click_point": None,
++                "bounding_box": None, "confidence": 0.0}
++
++    monkeypatch.setattr(
++        "app.services.ai_service._vision_target", fake_vision_target
+     )
+-    ref_audio.write_bytes(b"placeholder")
+-    ref_text.write_text("नमस्ते", encoding="utf-8")
+ 
+-    monkeypatch.setattr(tts_service, "HINGLISH_TTS_REPO", str(repo))
+-    monkeypatch.setattr(tts_service, "HINGLISH_REF_AUDIO", str(ref_audio))
+-    monkeypatch.setattr(tts_service, "HINGLISH_REF_TEXT_PATH", str(ref_text))
+-    monkeypatch.setattr(tts_service, "HINGLISH_PYTHON", sys.executable)
++    screenshot, visual = _select_screenshot_and_visual(
++        SCREENSHOTS, source_page=1, piece="Explains a concept.", kind="explanation"
++    )
+ 
+-    duration = tts_service._generate_local_hinglish_subprocess(
+-        "Ab New button par click kijiye.",
+-        output,
++    assert screenshot["path"] == "p1_a.png"
++    assert visual["found"] is False
++    assert calls == []
++
++
++def test_action_grounds_against_every_same_page_candidate_and_keeps_best(monkeypatch):
++    # Regression test for the "always screenshot[0]" bug: the control
++    # for this action is only visible in the SECOND screenshot on the
++    # page, so grounding must pick that one, not the first.
++    def fake_vision_target(path, action):
++        if path == "p1_b.png":
++            return {
++                "found": True,
++                "target_name": "Filter button",
++                "click_point": [0.5, 0.5],
++                "bounding_box": [0.4, 0.4, 0.6, 0.6],
++                "confidence": 0.91,
++            }
++        return {"found": False, "target_name": "", "click_point": None,
++                "bounding_box": None, "confidence": 0.0}
++
++    monkeypatch.setattr(
++        "app.services.ai_service._vision_target", fake_vision_target
+     )
+ 
+-    assert output.exists()
+-    assert 0.9 < duration < 1.1
++    screenshot, visual = _select_screenshot_and_visual(
++        SCREENSHOTS, source_page=1, piece="Click Filter.", kind="action"
++    )
+ 
++    assert screenshot["path"] == "p1_b.png"
++    assert visual["found"] is True
++    assert visual["target_name"] == "Filter button"
+ 
+-def test_local_hinglish_failure_is_fatal(monkeypatch, tmp_path):
+-    from app.services import tts_service
+ 
+-    monkeypatch.setattr(tts_service, "TTS_PROVIDER", "local_hinglish")
++def test_action_with_no_grounded_candidate_falls_back_to_first_screenshot(monkeypatch):
+     monkeypatch.setattr(
+-        tts_service,
+-        "_generate_one",
+-        lambda text, wav: (_ for _ in ()).throw(RuntimeError("demo failure")),
++        "app.services.ai_service._vision_target",
++        lambda path, action: {
++            "found": False, "target_name": "", "click_point": None,
++            "bounding_box": None, "confidence": 0.0,
++        },
++    )
++
++    screenshot, visual = _select_screenshot_and_visual(
++        SCREENSHOTS, source_page=1, piece="Click Save.", kind="action"
+     )
+ 
+-    try:
+-        tts_service.generate_narration(
+-            {"steps": [{"tts_narration": "Ab click kijiye."}]},
+-            tmp_path,
+-        )
+-    except RuntimeError as exc:
+-        assert "TTS failed for step 1" in str(exc)
+-    else:
+-        raise AssertionError("local_hinglish failure must be fatal")
+-
+-
+-def test_kokoro_language_config_and_voice_validation():
+-    from app.services import tts_service
+-    key, config = tts_service._kokoro_config("en-us")
+-    assert key == "en-us"
+-    assert config["lang_code"] == "a"
+-    assert "af_heart" in tts_service.KOKORO_VOICES["a"]
+-    key, config = tts_service._kokoro_config("hinglish")
+-    assert config["lang_code"] == "h"
+-    assert "hf_alpha" in tts_service.KOKORO_VOICES["h"]
+-
+-
+-def test_kokoro_pcm16_output_validation(monkeypatch, tmp_path):
+-    import numpy as np
++    assert screenshot["path"] == "p1_a.png"
++    assert visual["found"] is False
++
++
++# ----------------------------------------------------------------------
++# Scene pacing / minimum duration floor
++# ----------------------------------------------------------------------
++
++def test_short_action_narration_is_padded_up_to_the_floor(tmp_path):
++    import wave
++
++    wav = tmp_path / "short.wav"
++    with wave.open(str(wav), "wb") as w:
++        w.setnchannels(1)
++        w.setsampwidth(2)
++        w.setframerate(16000)
++        # ~0.3s clip -- shorter than the action floor.
++        w.writeframes(b"\x00\x00" * int(16000 * 0.3))
++
++    scene = {"kind": "action", "narration": "Click Save."}
++    duration = _audio_duration_for_scene(scene, index=0, audio_paths=[str(wav)])
++
++    assert duration >= MIN_SCENE_SECONDS["action"]
++
++
++def test_long_action_narration_keeps_its_own_length_plus_padding(tmp_path):
+     import wave
+-    from app.services import tts_service
+-
+-    class FakePipeline:
+-        def __call__(self, text, voice):
+-            assert voice == "hf_alpha"
+-            yield ("", "", np.zeros(24000, dtype=np.float32))
+-
+-    monkeypatch.setattr(tts_service, "_get_kokoro_pipeline", lambda language: (FakePipeline(), tts_service.KOKORO_LANGUAGE_CONFIG["hinglish"]))
+-    out = tmp_path / "kokoro.wav"
+-    duration = tts_service._generate_kokoro_speech("test", out, language="hinglish", voice="hf_alpha")
+-    assert 0.9 < duration < 1.1
+-    with wave.open(str(out), "rb") as w:
+-        assert w.getsampwidth() == 2
+-        assert w.getframerate() == 24000
++
++    wav = tmp_path / "long.wav"
++    with wave.open(str(wav), "wb") as w:
++        w.setnchannels(1)
++        w.setsampwidth(2)
++        w.setframerate(16000)
++        w.writeframes(b"\x00\x00" * 16000 * 5)  # 5s clip
++
++    scene = {"kind": "action", "narration": "..."}
++    duration = _audio_duration_for_scene(scene, index=0, audio_paths=[str(wav)])
++
++    assert duration == 5.0 + SCENE_PADDING_SECONDS
+-- 
+2.43.0
+
