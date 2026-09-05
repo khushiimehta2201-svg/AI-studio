@@ -22,11 +22,8 @@ def _generate_windows_sapi(text: str, output_path: str) -> float:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Sanitize text for PowerShell
-    clean_text = text.replace("'", " ").replace('"', ' ').replace("`", " ").strip()
-    if not clean_text:
-        clean_text = "Continuing to next step."
-
+    # Clean text to single line and double up single-quotes for PowerShell safety
+    clean_text = " ".join(str(text or "Next step.").replace("'", "''").split())
     safe_output = str(output_path.resolve()).replace("'", "''")
 
     ps_script = f"""
@@ -99,7 +96,7 @@ def generate_narration(
             else:
                 duration = _generate_kokoro(text, str(wav_path))
         except Exception as e:
-            print(f"[TTS] Error on step {i+1}: {e}. Retrying fallback SAPI...")
+            print(f"[TTS] Error on step {i+1}: {e}. Retrying SAPI fallback...")
             duration = _generate_windows_sapi(text, str(wav_path))
 
         result.append({

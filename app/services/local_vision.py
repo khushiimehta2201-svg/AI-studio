@@ -4,7 +4,8 @@ import os
 from typing import Any, Dict, Optional
 import requests
 
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11435").rstrip("/")
+OLLAMA_URL = os.getenv("OLLAMA_URL", f"{OLLAMA_HOST}/api/generate")
 VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "qwen2.5vl:7b")
 VISION_TIMEOUT = int(os.getenv("OLLAMA_VISION_TIMEOUT", "30"))
 
@@ -19,8 +20,19 @@ def _empty_result(confidence: float = 0.0) -> Dict[str, Any]:
     }
 
 
+def _normalize_coordinate(val: Any) -> float:
+    try:
+        v = float(val)
+        if v > 100.0:
+            v = v / 1000.0
+        elif v > 1.0:
+            v = v / 100.0
+        return max(0.06, min(0.92, v))
+    except Exception:
+        return 0.50
+
+
 def analyze_image(image_path: Optional[str], action_text: str) -> Dict[str, Any]:
-    # 1. Null-safe check: return immediately if no image path exists (e.g. text-only slides)
     if not image_path or not isinstance(image_path, (str, os.PathLike)):
         return _empty_result()
 
@@ -36,14 +48,17 @@ def analyze_image(image_path: Optional[str], action_text: str) -> Dict[str, Any]
         return _empty_result()
 
     prompt = f"""
-Identify the bounding box and center click coordinates of the UI control for the action: "{action_text}".
-Coordinates must be normalized from 0.0 to 1.0 relative to image width and height.
+Locate the ONE ACTUAL INTERACTIVE UI COMPONENT (e.g., button, search bar, dropdown, input text field) for the action: "{action_text}".
 
-Return ONLY JSON:
+CRITICAL INSTRUCTIONS:
+1. If the screenshot contains a red/orange numbered callout circle (1, 2, 3), DO NOT target the circle or the number itself!
+2. Target the actual UI button or field indicated by or adjacent to the callout badge.
+3. Return click_point as [x, y] in range 0 to 1000 relative to image width and height.
+
+Return ONLY valid JSON:
 {{
   "found": true,
-  "target_name": "button name",
-  "bounding_box": [ymin, xmin, ymax, xmax],
+  "target_name": "name of UI component",
   "click_point": [x, y],
   "confidence": 0.85
 }}
@@ -62,24 +77,24 @@ Return ONLY JSON:
         res = requests.post(OLLAMA_URL, json=payload, timeout=VISION_TIMEOUT)
         res.raise_for_status()
         body = res.json()
-        raw = body.get("response", "")
-        data = json.loads(raw)
+        raw_text = body.get("response", "")
+        data = json.loads(raw_text)
 
         if not data.get("found"):
             return _empty_result()
 
         pt = data.get("click_point")
         if isinstance(pt, (list, tuple)) and len(pt) == 2:
-            x = max(0.0, min(1.0, float(pt[0])))
-            y = max(0.0, min(1.0, float(pt[1])))
+            norm_x = _normalize_coordinate(pt[0])
+            norm_y = _normalize_coordinate(pt[1])
             return {
                 "found": True,
-                "target_name": data.get("target_name", ""),
-                "click_point": [x, y],
+                "target_name": str(data.get("target_name", "")).strip(),
+                "click_point": [norm_x, norm_y],
                 "bounding_box": data.get("bounding_box"),
-                "confidence": float(data.get("confidence", 0.7)),
+                "confidence": float(data.get("confidence", 0.75)),
             }
     except Exception as e:
-        print(f"[VISION] Qwen inference skipped: {e}")
+        print(f"[VISION] Qwen-VL notice: {e}")
 
     return _empty_result()
