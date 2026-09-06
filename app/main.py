@@ -19,7 +19,7 @@ load_dotenv(BASE / ".env")
 from app.services.pdf_service import process_pdf
 from app.services.ai_service import build_tutorial_plan
 from app.services.tts_service import generate_narration
-from app.services.video_service import render
+from app.services.video_service import render_all_sections
 
 
 JOBS = BASE / "jobs"
@@ -112,6 +112,17 @@ async def status(jid: str):
         )
 
     return jobs[jid]
+
+
+@app.get("/plan/{jid}")
+async def get_plan(jid: str):
+    plan_path = JOBS / jid / "plan.json"
+    if not plan_path.exists():
+        return JSONResponse(
+            {"error": "Plan not ready yet"},
+            status_code=404,
+        )
+    return json.loads(plan_path.read_text(encoding="utf-8"))
 
 
 def run_job(jid, pdf):
@@ -270,44 +281,50 @@ def run_job(jid, pdf):
         )
 
         # ---------------------------------------------------------
-        # 4. VIDEO
+        # 4. VIDEO (one file per section, not one monolithic video)
         # ---------------------------------------------------------
 
-        final = job / "tutorial.mp4"
+        render_all_sections(plan, audio, job)
 
-        render(
-            plan,
-            audio,
-            job,
-            final,
+        rendered_sections = sum(
+            1 for s in plan.get("sections", []) if s.get("video_file")
         )
-
-        if (
-            not final.exists()
-            or final.stat().st_size < 10000
-        ):
+        if rendered_sections == 0:
             raise RuntimeError(
-                "Generated video is missing or invalid."
+                "No section produced a usable video -- check that the "
+                "PDF contains recognizable action steps with screenshots."
             )
+
+        # Resolve section media into URLs the frontend can hit directly,
+        # and persist the final plan (now including video/caption filenames)
+        # so /plan/{jid} can be re-fetched independently of job status.
+        for section in plan.get("sections", []):
+            section["video_url"] = (
+                f"/media/{jid}/{section['video_file']}"
+                if section.get("video_file") else None
+            )
+            section["captions_url"] = (
+                f"/media/{jid}/{section['captions_file']}"
+                if section.get("captions_file") else None
+            )
+
+        (job / "plan.json").write_text(
+            json.dumps(plan, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
         jobs[jid].update(
             status="completed",
             progress=100,
             message="Tutorial ready",
-            video_url=(
-                f"/media/{jid}/tutorial.mp4"
-            ),
-            video_path=str(final),
-            title=plan.get(
-                "title",
-                "AI Learning Tutorial",
-            ),
+            plan_url=f"/plan/{jid}",
+            title=plan.get("title", "AI Learning Tutorial"),
+            section_count=len(plan.get("sections", [])),
         )
 
         print(
             f"[VIDEO] {jid} generated successfully: "
-            f"{final} "
-            f"({final.stat().st_size / (1024 * 1024):.2f} MB)"
+            f"{rendered_sections} section video(s) in {job}"
         )
 
     except Exception as exc:

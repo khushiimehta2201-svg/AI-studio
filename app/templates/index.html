@@ -111,6 +111,122 @@
                 min-height: 250px;
             }
         }
+
+        /* =====================================================
+           TWO-PANE INTERACTIVE SECTION PLAYER
+           ===================================================== */
+
+        .player-wrap {
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 16px;
+            margin-top: 18px;
+        }
+
+        .player-video-pane {
+            background: #111;
+            border-radius: 12px;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .player-video-pane .no-video-msg {
+            display: none;
+            align-items: center;
+            justify-content: center;
+            min-height: 420px;
+            color: #ccc;
+            font-size: 14px;
+            padding: 24px;
+            text-align: center;
+        }
+
+        .player-video-pane.no-video #vid {
+            display: none;
+        }
+
+        .player-video-pane.no-video .no-video-msg {
+            display: flex;
+        }
+
+        .player-theory-pane {
+            background: #fafafa;
+            border: 1px solid #eaeaea;
+            border-radius: 12px;
+            padding: 16px 18px;
+            max-height: 480px;
+            overflow-y: auto;
+        }
+
+        .player-theory-pane h3 {
+            margin: 0 0 10px 0;
+            font-size: 15px;
+        }
+
+        .player-theory-pane ul {
+            margin: 0;
+            padding-left: 18px;
+        }
+
+        .player-theory-pane li {
+            margin-bottom: 8px;
+            font-size: 13.5px;
+            line-height: 1.45;
+            color: #333;
+        }
+
+        .player-theory-pane .empty {
+            color: #999;
+            font-size: 13px;
+            font-style: italic;
+        }
+
+        .player-nav {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            margin-top: 14px;
+            gap: 10px;
+        }
+
+        .player-nav button {
+            flex: 0 0 auto;
+            width: auto;
+            margin-top: 0;
+        }
+
+        .player-nav .section-indicator {
+            flex: 1 1 160px;
+            min-width: 0;
+            text-align: center;
+            font-size: 13px;
+            color: #666;
+        }
+
+        .player-nav .section-indicator strong {
+            color: #222;
+        }
+
+        #sectionTitle {
+            overflow-wrap: anywhere;
+            white-space: normal;
+        }
+
+        @media (max-width: 800px) {
+            .player-wrap {
+                grid-template-columns: 1fr;
+            }
+
+            .player-nav {
+                justify-content: center;
+            }
+
+            .player-nav .section-indicator {
+                order: 3;
+                flex-basis: 100%;
+            }
+        }
     </style>
 </head>
 
@@ -280,7 +396,7 @@
                 target="_blank"
                 rel="noopener"
             >
-                Open video
+                Open section video
             </a>
 
         </div>
@@ -291,17 +407,48 @@
         </div>
 
 
-        <div class="video-wrap">
+        <div class="player-wrap">
 
-            <video
-                id="vid"
-                controls
-                playsinline
-                preload="metadata"
+            <div
+                id="videoPane"
+                class="player-video-pane"
             >
-                Your browser does not support HTML5 video.
-            </video>
+                <video
+                    id="vid"
+                    controls
+                    playsinline
+                    preload="metadata"
+                >
+                    Your browser does not support HTML5 video.
+                </video>
 
+                <div class="no-video-msg">
+                    This section has no screen recording &mdash;
+                    it's background/theory only. Read the notes
+                    on the right, then use Next to continue.
+                </div>
+            </div>
+
+            <div
+                id="theoryPane"
+                class="player-theory-pane"
+            >
+                <h3 id="theoryTitle">Overview</h3>
+                <ul id="theoryList"></ul>
+            </div>
+
+        </div>
+
+
+        <div class="player-nav">
+            <button id="prevSection" type="button">&larr; Previous</button>
+
+            <div class="section-indicator">
+                <strong id="sectionPos">Section 1 of 1</strong>
+                <div id="sectionTitle"></div>
+            </div>
+
+            <button id="nextSection" type="button">Next &rarr;</button>
         </div>
 
 
@@ -373,6 +520,27 @@
     const jobInfo =
         document.getElementById("jobInfo");
 
+    const videoPane =
+        document.getElementById("videoPane");
+
+    const theoryTitle =
+        document.getElementById("theoryTitle");
+
+    const theoryList =
+        document.getElementById("theoryList");
+
+    const prevSectionBtn =
+        document.getElementById("prevSection");
+
+    const nextSectionBtn =
+        document.getElementById("nextSection");
+
+    const sectionPos =
+        document.getElementById("sectionPos");
+
+    const sectionTitleEl =
+        document.getElementById("sectionTitle");
+
 
     // =========================================================
     // STATE
@@ -380,6 +548,9 @@
 
     let selectedFile = null;
     let pollingTimer = null;
+    let currentPlan = null;
+    let currentSectionIndex = 0;
+
 
 
     // =========================================================
@@ -959,130 +1130,67 @@
             "Tutorial ready"
         );
 
-
-        let videoUrl =
-            data.video_url ||
-            data.video ||
-            data.url ||
-            null;
-
-
-        if (!videoUrl) {
-
-            videoUrl =
-                "/media/" +
-                encodeURIComponent(jobId) +
-                "/tutorial.mp4";
-        }
-
-
-        if (
-            typeof videoUrl === "string" &&
-            videoUrl.startsWith("/")
-        ) {
-
-            videoUrl +=
-                (
-                    videoUrl.includes("?")
-                        ? "&"
-                        : "?"
-                ) +
-                "t=" +
-                Date.now();
-        }
-
-
         tutorialTitle.textContent =
             data.title ||
             "Working Tutorial";
 
-
         metadata.textContent =
-            data.message ||
             "Generated from the uploaded PDF with embedded screenshots, English narration, captions, and visual cursor guidance.";
-
 
         resultSection.classList.remove(
             "hidden"
         );
 
-
-        openVideo.href =
-            videoUrl;
-
-
         videoStatus.textContent =
-            "Loading generated tutorial video...";
+            "Loading section plan...";
 
         videoStatus.className =
             "video-status";
 
+        try {
 
-        video.pause();
+            const planUrl =
+                data.plan_url ||
+                ("/plan/" + encodeURIComponent(jobId));
 
-        video.removeAttribute(
-            "src"
-        );
+            const response =
+                await fetch(planUrl, { cache: "no-store" });
 
-        video.load();
-
-
-        await new Promise(
-            resolve =>
-                setTimeout(
-                    resolve,
-                    100
-                )
-        );
-
-
-        video.src =
-            videoUrl;
-
-        video.load();
-
-
-        video.onloadedmetadata =
-            function () {
-
-                videoStatus.textContent =
-                    "Video ready • " +
-                    formatDuration(
-                        video.duration
-                    );
-
-                videoStatus.className =
-                    "video-status success";
-            };
-
-
-        video.oncanplay =
-            function () {
-
-                videoStatus.textContent =
-                    "Video ready to play.";
-
-                videoStatus.className =
-                    "video-status success";
-            };
-
-
-        video.onerror =
-            function () {
-
-                console.error(
-                    "VIDEO LOAD ERROR",
-                    video.error
+            if (!response.ok) {
+                throw new Error(
+                    "Could not load the generated section plan."
                 );
+            }
 
+            currentPlan =
+                await response.json();
 
-                videoStatus.textContent =
-                    "The tutorial was generated, but the browser could not load the MP4. Use 'Open video' above.";
+            if (
+                !currentPlan.sections ||
+                currentPlan.sections.length === 0
+            ) {
+                throw new Error(
+                    "The tutorial has no sections to display."
+                );
+            }
 
-                videoStatus.className =
-                    "video-status error";
-            };
+            currentSectionIndex = 0;
+            renderSection(currentSectionIndex);
 
+        } catch (error) {
+
+            console.error(
+                "Plan load error:",
+                error
+            );
+
+            videoStatus.textContent =
+                error.message ||
+                "Unable to load the generated tutorial sections.";
+
+            videoStatus.className =
+                "video-status error";
+        }
 
         generateButton.disabled =
             false;
@@ -1091,6 +1199,169 @@
             "Generate another tutorial";
 
     }
+
+
+    // =========================================================
+    // SECTION PLAYER (two-pane: video+cursor left, theory right,
+    // prev/next navigation across the document's sections)
+    // =========================================================
+
+    function renderSection(index) {
+
+        if (
+            !currentPlan ||
+            !currentPlan.sections ||
+            !currentPlan.sections[index]
+        ) {
+            return;
+        }
+
+        const section =
+            currentPlan.sections[index];
+
+        const total =
+            currentPlan.sections.length;
+
+        // --- theory pane: shortened, unnarrated bullet points ---
+
+        theoryTitle.textContent =
+            section.title || ("Section " + (index + 1));
+
+        theoryList.innerHTML = "";
+
+        const bullets =
+            section.theory_bullets || [];
+
+        if (bullets.length === 0) {
+
+            const li =
+                document.createElement("li");
+
+            li.className = "empty";
+            li.textContent = "No background notes for this section.";
+            theoryList.appendChild(li);
+
+        } else {
+
+            bullets.forEach(function (bullet) {
+
+                const li =
+                    document.createElement("li");
+
+                li.textContent = bullet;
+                theoryList.appendChild(li);
+            });
+        }
+
+        // --- video pane: per-section rendered screenshot/cursor video ---
+
+        video.pause();
+        video.removeAttribute("src");
+
+        while (video.firstChild) {
+            video.removeChild(video.firstChild);
+        }
+
+        if (section.video_url) {
+
+            videoPane.classList.remove("no-video");
+
+            openVideo.classList.remove("hidden");
+            openVideo.href = section.video_url;
+
+            const src =
+                document.createElement("source");
+
+            src.src =
+                section.video_url +
+                (
+                    section.video_url.includes("?")
+                        ? "&"
+                        : "?"
+                ) +
+                "t=" +
+                Date.now();
+
+            src.type = "video/mp4";
+            video.appendChild(src);
+
+            if (section.captions_url) {
+
+                const track =
+                    document.createElement("track");
+
+                track.kind = "captions";
+                track.label = "English";
+                track.srclang = "en";
+                track.src = section.captions_url;
+                track.default = true;
+                video.appendChild(track);
+            }
+
+            video.load();
+
+            videoStatus.textContent =
+                "Loading section video...";
+
+            videoStatus.className =
+                "video-status";
+
+            video.oncanplay = function () {
+                videoStatus.textContent =
+                    "Section ready to play.";
+                videoStatus.className =
+                    "video-status success";
+            };
+
+            video.onerror = function () {
+                videoStatus.textContent =
+                    "This section's video could not be loaded.";
+                videoStatus.className =
+                    "video-status error";
+            };
+
+        } else {
+
+            // Theory-only section -- no screen recording for it, by design.
+            videoPane.classList.add("no-video");
+
+            openVideo.classList.add("hidden");
+
+            videoStatus.textContent =
+                "This section has no screen recording.";
+
+            videoStatus.className =
+                "video-status";
+        }
+
+        // --- nav state ---
+
+        sectionPos.textContent =
+            "Section " + (index + 1) + " of " + total;
+
+        sectionTitleEl.textContent =
+            section.title || "";
+
+        prevSectionBtn.disabled = (index === 0);
+        nextSectionBtn.disabled = (index === total - 1);
+    }
+
+    prevSectionBtn.addEventListener("click", function () {
+        if (currentSectionIndex > 0) {
+            currentSectionIndex -= 1;
+            renderSection(currentSectionIndex);
+        }
+    });
+
+    nextSectionBtn.addEventListener("click", function () {
+        if (
+            currentPlan &&
+            currentSectionIndex < currentPlan.sections.length - 1
+        ) {
+            currentSectionIndex += 1;
+            renderSection(currentSectionIndex);
+        }
+    });
 
 
     // =========================================================
