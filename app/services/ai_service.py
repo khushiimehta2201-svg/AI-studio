@@ -1,10 +1,14 @@
+import difflib
+import functools
 import json
 import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
+import pytesseract
 import requests
+from pytesseract import Output
 
 from app.services.local_vision import analyze_image
 
@@ -13,6 +17,8 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
 OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "60"))
 VISION_ENABLED = os.getenv("OLLAMA_VISION_ENABLED", "true").lower() == "true"
 VISION_MIN_CONFIDENCE = float(os.getenv("OLLAMA_VISION_MIN_CONFIDENCE", "0.55"))
+OCR_MIN_CONFIDENCE = float(os.getenv("OCR_MIN_CONFIDENCE", "40"))
+OCR_FUZZY_MIN_RATIO = float(os.getenv("OCR_FUZZY_MIN_RATIO", "0.72"))
 
 ACTION_VERBS = (
     "double click", "double-click", "right click", "right-click",
@@ -292,6 +298,105 @@ def _fallback_cursor(shot_path: str):
         return None
 
 
+@functools.lru_cache(maxsize=512)
+def _ocr_words(image_path: str) -> Tuple[Tuple[str, float, float, float, float], ...]:
+    """OCRs the screenshot directly and returns (text, x0, y0, x1, y1) in
+    that image's own pixel coordinates. Cached per path since several
+    actions commonly map to the same screenshot and would otherwise repeat
+    the same OCR pass. This is ground truth for what's actually drawn on
+    screen -- it works whether or not the PDF happens to carry an
+    extractable text layer over the image."""
+    try:
+        img = cv2.imread(str(image_path))
+        if img is None:
+            return tuple()
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape[:2]
+        # Tesseract is noticeably more accurate on small UI text once
+        # upscaled -- most screenshots embedded in a PDF are well under
+        # the resolution OCR engines are tuned for.
+        scale = 2 if max(h, w) < 1600 else 1
+        if scale > 1:
+            gray = cv2.resize(gray, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
+
+        data = pytesseract.image_to_data(gray, output_type=Output.DICT, config="--psm 11")
+        words = []
+        for i in range(len(data.get("text", []))):
+            text = (data["text"][i] or "").strip()
+            try:
+                conf = float(data["conf"][i])
+            except (TypeError, ValueError):
+                conf = -1.0
+            if not text or conf < OCR_MIN_CONFIDENCE:
+                continue
+            x, y, bw, bh = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
+            words.append((text, x / scale, y / scale, (x + bw) / scale, (y + bh) / scale))
+        return tuple(words)
+    except Exception as e:
+        print(f"[OCR] failed on {image_path}: {e}")
+        return tuple()
+
+
+def _find_ocr_target(query: str, image_path: Optional[str]):
+    """Finds the query phrase directly in the screenshot's own rendered
+    pixels via OCR. This is the primary source for any control with a
+    visible text label ('Login', 'Change Password', a dropdown's current
+    value, etc.) -- it reads what's actually on screen instead of guessing
+    from PDF text placement or trusting a vision model's own coordinate
+    space."""
+    if not image_path or not query or not os.path.exists(str(image_path)):
+        return None
+    img = cv2.imread(str(image_path))
+    if img is None:
+        return None
+    h, w = img.shape[:2]
+
+    words = _ocr_words(str(image_path))
+    if not words:
+        return None
+
+    q_tokens = [t.lower() for t in re.findall(r"[A-Za-z0-9]+", query)]
+    if not q_tokens:
+        return None
+    ocr_tokens = [re.sub(r"[^A-Za-z0-9]", "", t[0]).lower() for t in words]
+
+    for n in range(min(len(q_tokens), 4), 0, -1):
+        target = q_tokens[:n]
+        for i in range(0, max(0, len(words) - n + 1)):
+            if ocr_tokens[i:i + n] != target:
+                continue
+            chunk = words[i:i + n]
+            x0 = min(c[1] for c in chunk)
+            y0 = min(c[2] for c in chunk)
+            x1 = max(c[3] for c in chunk)
+            y1 = max(c[4] for c in chunk)
+            matched = " ".join(c[0] for c in chunk)
+            return (x0 + x1) / 2.0 / w, (y0 + y1) / 2.0 / h, matched
+
+    # Fuzzy fallback -- OCR occasionally misreads a character ("Passvvord"),
+    # so try approximate matching before giving up on this screenshot.
+    query_phrase = " ".join(q_tokens)
+    best_ratio, best_hit = 0.0, None
+    for window in range(1, min(4, len(words)) + 1):
+        for i in range(0, len(words) - window + 1):
+            chunk = words[i:i + window]
+            phrase = " ".join(re.sub(r"[^A-Za-z0-9]", "", c[0]).lower() for c in chunk)
+            if not phrase:
+                continue
+            ratio = difflib.SequenceMatcher(None, phrase, query_phrase).ratio()
+            if ratio > best_ratio:
+                x0 = min(c[1] for c in chunk)
+                y0 = min(c[2] for c in chunk)
+                x1 = max(c[3] for c in chunk)
+                y1 = max(c[4] for c in chunk)
+                best_ratio = ratio
+                best_hit = ((x0 + x1) / 2.0 / w, (y0 + y1) / 2.0 / h, " ".join(c[0] for c in chunk))
+
+    if best_hit and best_ratio >= OCR_FUZZY_MIN_RATIO:
+        return best_hit
+    return None
+
+
 def _ground_action(
     query: str,
     page: Optional[Dict[str, Any]],
@@ -306,6 +411,12 @@ def _ground_action(
     if box_pt:
         return {"point": box_pt, "source": "annotation", "confidence": 0.95, "target_name": query}
 
+    if query and screenshot.get("path"):
+        ocr_hit = _find_ocr_target(query, screenshot["path"])
+        if ocr_hit:
+            nx, ny, matched = ocr_hit
+            return {"point": [nx, ny], "source": "ocr", "confidence": 0.90, "target_name": matched}
+
     if page and screenshot.get("page_rect") and query:
         page_w, page_h = page.get("width") or 0, page.get("height") or 0
         if page_w and page_h:
@@ -313,7 +424,7 @@ def _ground_action(
                 nx, ny = ax / page_w, ay / page_h
                 mapped = _map_page_point_to_screenshot(nx, ny, page_w, page_h, screenshot)
                 if mapped:
-                    return {"point": list(mapped), "source": "text", "confidence": 0.85, "target_name": matched}
+                    return {"point": list(mapped), "source": "text", "confidence": 0.80, "target_name": matched}
 
     if VISION_ENABLED and screenshot.get("path"):
         vis = analyze_image(screenshot["path"], query or "the relevant control")
@@ -326,11 +437,16 @@ def _ground_action(
             }
 
     if screenshot.get("path"):
-        pt = _fallback_cursor(screenshot["path"])
-        if pt:
-            return {"point": list(pt), "source": "heuristic", "confidence": 0.2, "target_name": query}
+        # Diagnostic only -- log what the generic heuristic would have
+        # guessed, but never surface it as the actual cursor. A scene with
+        # no confidently-grounded target plays narration/caption over the
+        # plain screenshot with no cursor at all (see video_service, which
+        # already skips drawing when targets is empty).
+        diag = _fallback_cursor(screenshot["path"])
+        print(f"[GROUND] No confident target for '{query}' on {screenshot['path']} "
+              f"(heuristic-only guess would have been {diag}, not used)")
 
-    return None
+    return {"point": None, "source": "none", "confidence": 0.0, "target_name": query}
 
 
 # ---------------------------------------------------------------------------
@@ -406,81 +522,85 @@ def build_tutorial_plan(
         explanation_chunks: List[str] = []
         step_ids_for_section: List[int] = []
 
+        # Gather this section's screenshots and action lines across ALL of
+        # its pages, in reading order. A section (topic) -- not a single
+        # page -- is the natural scope for matching N actions to M
+        # screenshots, since a topic's steps commonly span more than one
+        # page.
+        section_shots: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+        section_actions: List[Tuple[Dict[str, Any], str]] = []
+
         for page in sec["pages"]:
-            page_no = page["page"]
             lines = [l.strip() for l in page.get("text", "").splitlines() if l.strip()]
-            action_lines = [l for l in lines if _is_action_line(l)]
-            explanation_lines = [l for l in lines if not _is_action_line(l)]
+            heading = page.get("heading")
+            content_lines = [l for l in lines if l != heading]
+            action_lines = [l for l in content_lines if _is_action_line(l)]
+            explanation_lines = [l for l in content_lines if not _is_action_line(l)]
             if explanation_lines:
                 explanation_chunks.append(" ".join(explanation_lines))
 
-            if not action_lines:
-                continue
+            page_shots = [s for s in shots_by_page.get(page["page"], []) if not s.get("is_full_page")]
+            section_shots.extend((page, s) for s in page_shots)
+            section_actions.extend((page, l) for l in action_lines)
 
-            page_shots = shots_by_page.get(page_no, [])
-            real_shots = [s for s in page_shots if not s.get("is_full_page")]
-
-            if real_shots:
-                n_actions, n_shots = len(action_lines), len(real_shots)
-                # Spread actions across this page's screenshots in reading
-                # order instead of pinning everything to the first region.
-                assigned = [min(n_shots - 1, (i * n_shots) // n_actions) for i in range(n_actions)]
-                counts: Dict[int, int] = {}
-                for s_idx in assigned:
+        if section_actions:
+            n_actions, n_shots = len(section_actions), len(section_shots)
+            assigned_idx = (
+                [min(n_shots - 1, (i * n_shots) // n_actions) for i in range(n_actions)]
+                if n_shots > 0 else [None] * n_actions
+            )
+            counts: Dict[int, int] = {}
+            for s_idx in assigned_idx:
+                if s_idx is not None:
                     counts[s_idx] = counts.get(s_idx, 0) + 1
-                running: Dict[int, int] = {}
+            running: Dict[int, int] = {}
 
-                for i, line in enumerate(action_lines):
-                    s_idx = assigned[i]
-                    screenshot = real_shots[s_idx]
+            for i, (page, line) in enumerate(section_actions):
+                query = _target_query(line)
+                s_idx = assigned_idx[i]
+                grounding, chosen_page, chosen_shot = None, page, None
+
+                if s_idx is not None:
+                    chosen_page, chosen_shot = section_shots[s_idx]
                     idx_in_shot = running.get(s_idx, 0)
                     running[s_idx] = idx_in_shot + 1
+                    grounding = _ground_action(query, chosen_page, chosen_shot, idx_in_shot, counts.get(s_idx, 1))
 
-                    query = _target_query(line)
-                    grounding = _ground_action(query, page, screenshot, idx_in_shot, counts[s_idx])
-                    narration = _generate_screenshot_narration(line)
+                # Validation / reassignment: the proportional guess is only
+                # a starting point. If it didn't confidently find the named
+                # element, check whether a DIFFERENT screenshot in this
+                # same section does, and reassign to that one instead of
+                # keeping a wrong-but-confident-looking placement.
+                if (grounding is None or grounding.get("source") == "none") and n_shots > 1:
+                    for alt_page, alt_shot in section_shots:
+                        if alt_shot is chosen_shot:
+                            continue
+                        alt_grounding = _ground_action(query, alt_page, alt_shot, 0, 1)
+                        if alt_grounding and alt_grounding.get("source") != "none":
+                            grounding = alt_grounding
+                            chosen_page, chosen_shot = alt_page, alt_shot
+                            break
 
-                    step_id += 1
-                    steps.append({
-                        "id": step_id,
-                        "section_id": sec_idx + 1,
-                        "page_num": page_no,
-                        "kind": "action",
-                        "title": _clean_text(line)[:80],
-                        "narration": narration,
-                        "tts_narration": narration,
-                        "caption": narration,
-                        "screenshot": screenshot.get("path"),
-                        "is_full_page": False,
-                        "cursor": grounding["point"] if grounding else None,
-                        "targets": [grounding["point"]] if grounding else [],
-                        "cursor_source": grounding["source"] if grounding else "none",
-                        "cursor_confidence": grounding["confidence"] if grounding else 0.0,
-                        "cursor_target_name": grounding["target_name"] if grounding else "",
-                    })
-                    step_ids_for_section.append(step_id)
-            else:
-                for line in action_lines:
-                    narration = _generate_screenshot_narration(line)
-                    step_id += 1
-                    steps.append({
-                        "id": step_id,
-                        "section_id": sec_idx + 1,
-                        "page_num": page_no,
-                        "kind": "action",
-                        "title": _clean_text(line)[:80],
-                        "narration": narration,
-                        "tts_narration": narration,
-                        "caption": narration,
-                        "screenshot": None,
-                        "is_full_page": True,
-                        "cursor": None,
-                        "targets": [],
-                        "cursor_source": "none",
-                        "cursor_confidence": 0.0,
-                        "cursor_target_name": "",
-                    })
-                    step_ids_for_section.append(step_id)
+                narration = _generate_screenshot_narration(line)
+                step_id += 1
+                steps.append({
+                    "id": step_id,
+                    "section_id": sec_idx + 1,
+                    "page_num": chosen_page["page"],
+                    "kind": "action",
+                    "title": _clean_text(line)[:80],
+                    "narration": narration,
+                    "tts_narration": narration,
+                    "caption": narration,
+                    "screenshot": chosen_shot.get("path") if chosen_shot else None,
+                    "is_full_page": chosen_shot is None,
+                    "cursor": grounding["point"] if grounding else None,
+                    "targets": [grounding["point"]] if grounding and grounding.get("point") else [],
+                    "cursor_source": grounding["source"] if grounding else "none",
+                    "cursor_confidence": grounding["confidence"] if grounding else 0.0,
+                    "cursor_target_name": grounding["target_name"] if grounding else "",
+                })
+                step_ids_for_section.append(step_id)
 
         sections_out.append({
             "id": sec_idx + 1,

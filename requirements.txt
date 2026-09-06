@@ -9,6 +9,11 @@ requests==2.32.4
 python-dotenv==1.1.1
 opencv-python==4.10.0.84
 numpy==1.26.4
+pytesseract==0.3.13
+# System dependency: pytesseract needs the tesseract-ocr binary installed
+# separately (e.g. `apt install tesseract-ocr` on Linux, or the Windows
+# installer from https://github.com/UB-Mannheim/tesseract/wiki) -- pip
+# only installs the Python wrapper, not the OCR engine itself.
 
 # Optional local Kokoro TTS demo backend (Apache 2.0)
 kokoro==0.9.4

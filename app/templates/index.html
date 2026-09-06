@@ -123,30 +123,19 @@
             margin-top: 18px;
         }
 
+        .player-wrap.theory-only {
+            grid-template-columns: 1fr;
+        }
+
+        .player-wrap.theory-only .player-video-pane {
+            display: none;
+        }
+
         .player-video-pane {
             background: #111;
             border-radius: 12px;
             overflow: hidden;
             position: relative;
-        }
-
-        .player-video-pane .no-video-msg {
-            display: none;
-            align-items: center;
-            justify-content: center;
-            min-height: 420px;
-            color: #ccc;
-            font-size: 14px;
-            padding: 24px;
-            text-align: center;
-        }
-
-        .player-video-pane.no-video #vid {
-            display: none;
-        }
-
-        .player-video-pane.no-video .no-video-msg {
-            display: flex;
         }
 
         .player-theory-pane {
@@ -407,7 +396,7 @@
         </div>
 
 
-        <div class="player-wrap">
+        <div id="playerWrap" class="player-wrap">
 
             <div
                 id="videoPane"
@@ -421,12 +410,6 @@
                 >
                     Your browser does not support HTML5 video.
                 </video>
-
-                <div class="no-video-msg">
-                    This section has no screen recording &mdash;
-                    it's background/theory only. Read the notes
-                    on the right, then use Next to continue.
-                </div>
             </div>
 
             <div
@@ -522,6 +505,9 @@
 
     const videoPane =
         document.getElementById("videoPane");
+
+    const playerWrap =
+        document.getElementById("playerWrap");
 
     const theoryTitle =
         document.getElementById("theoryTitle");
@@ -1264,7 +1250,7 @@
 
         if (section.video_url) {
 
-            videoPane.classList.remove("no-video");
+            playerWrap.classList.remove("theory-only");
 
             openVideo.classList.remove("hidden");
             openVideo.href = section.video_url;
@@ -1322,16 +1308,17 @@
 
         } else {
 
-            // Theory-only section -- no screen recording for it, by design.
-            videoPane.classList.add("no-video");
+            // Theory-only section -- normal and expected, not an error.
+            // The video pane is hidden entirely and the theory pane takes
+            // the full width, rather than showing an apology message in
+            // an empty video box.
+            playerWrap.classList.add("theory-only");
 
             openVideo.classList.add("hidden");
 
-            videoStatus.textContent =
-                "This section has no screen recording.";
-
+            videoStatus.textContent = "";
             videoStatus.className =
-                "video-status";
+                "video-status hidden";
         }
 
         // --- nav state ---

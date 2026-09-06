@@ -65,13 +65,19 @@ def _classify_page(text: str, page_no: int, total_pages: int, has_screenshot: bo
 
     # Title / cover page: only plausible in the first couple of pages,
     # short, no screenshot, and reads like a cover (author/confidentiality
-    # boilerplate, or just a big sparse heading with nothing actionable).
+    # boilerplate, or just a sparse title with nothing substantive). A
+    # short but genuinely substantive opening paragraph (e.g. a real
+    # "Overview" section) must NOT be caught here -- word count alone
+    # isn't a safe enough signal on its own.
     if page_no <= 2 and not has_screenshot:
         author_hits = sum(1 for l in lines if _AUTHOR_LINE.search(l))
         noise_hits = sum(1 for l in lines if _TITLE_NOISE.search(l))
         if author_hits >= 1 and word_count <= 120:
             return "author"
-        if word_count <= 40 and (noise_hits >= 1 or page_no == 1):
+        if noise_hits >= 1 and word_count <= 60:
+            return "title"
+        if page_no == 1 and word_count <= 12 and len(lines) <= 3:
+            # Genuinely just a title/subtitle, not a paragraph of content.
             return "title"
 
     return None
@@ -86,6 +92,10 @@ _HEADING_PATTERN = re.compile(
     re.I,
 )
 _NUMBERED_HEADING = re.compile(r"^\d+(\.\d+)?\s+[A-Z][A-Za-z0-9 /&\-]{3,80}$")
+_COMMON_SINGLE_WORD_HEADINGS = {
+    "overview", "introduction", "summary", "background", "prerequisites",
+    "objectives", "conclusion", "glossary", "appendix", "notes", "scope",
+}
 
 
 def _looks_like_heading(line: str) -> bool:
@@ -97,6 +107,8 @@ def _looks_like_heading(line: str) -> bool:
     if _HEADING_PATTERN.match(line):
         return True
     if _NUMBERED_HEADING.match(line):
+        return True
+    if line.strip(":").lower() in _COMMON_SINGLE_WORD_HEADINGS:
         return True
     # All-caps or Title Case short line with no terminal punctuation is a
     # reasonable generic heading heuristic for corporate docs.
