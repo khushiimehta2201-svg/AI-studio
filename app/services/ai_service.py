@@ -12,6 +12,34 @@ from pytesseract import Output
 
 from app.services.local_vision import analyze_image
 
+# On Windows, tesseract often isn't on PATH even after installing it. Rather
+# than requiring a PATH edit, allow pointing straight at the binary via an
+# env var -- e.g. set TESSERACT_CMD=C:\Program Files\Tesseract-OCR\tesseract.exe
+_tesseract_cmd = os.getenv("TESSERACT_CMD")
+if _tesseract_cmd:
+    pytesseract.pytesseract.tesseract_cmd = _tesseract_cmd
+
+try:
+    _TESSERACT_VERSION = pytesseract.get_tesseract_version()
+    print(f"[OCR] tesseract binary found (v{_TESSERACT_VERSION}) -- OCR-based cursor grounding is ACTIVE.")
+except Exception as _tess_err:
+    print(
+        "=" * 70 + "\n"
+        "[OCR] WARNING: the tesseract-ocr binary was NOT found on this "
+        "machine.\n"
+        "      pytesseract is installed, but it just wraps the real OCR "
+        "engine --\n"
+        "      without the engine itself, EVERY cursor-grounding call will "
+        "silently\n"
+        "      fail and no cursor will be drawn anywhere in the generated "
+        "video.\n"
+        "      Install it:\n"
+        "        Windows : https://github.com/UB-Mannheim/tesseract/wiki\n"
+        "        macOS   : brew install tesseract\n"
+        "        Linux   : apt install tesseract-ocr\n"
+        f"      Underlying error: {_tess_err}\n" + "=" * 70
+    )
+
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
 OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "60"))
@@ -197,22 +225,16 @@ Return ONLY JSON: {{"bullets": ["...", "..."]}}
 
 
 # ---------------------------------------------------------------------------
-# Cursor grounding -- priority order: explicit annotation > exact word match
-# on the page > vision-model grounding > generic visual heuristic > none.
+# Cursor grounding -- priority order: OCR read directly off the
+# screenshot's own pixels (primary, general-purpose text identification) >
+# PDF word match (secondary, for the rarer case of a real text layer over
+# the image) > vision-model grounding (icons with no readable text) > none.
 # Each source is confidence-tagged so the frontend/QA tooling can tell a
 # precise hit from a best-effort guess instead of treating every cursor the
-# same way.
+# same way. There is deliberately no colour/highlight/marker-based
+# detection: grounding is entirely based on identifying the actual words
+# named in the action text.
 # ---------------------------------------------------------------------------
-
-def _color_box_target(screenshot: Dict[str, Any], idx_in_shot: int, count_in_shot: int) -> Optional[List[float]]:
-    targets = screenshot.get("targets") or []
-    if not targets:
-        return None
-    if len(targets) == count_in_shot and 0 <= idx_in_shot < len(targets):
-        return list(targets[idx_in_shot])
-    if count_in_shot == 1 and len(targets) >= 1:
-        return list(targets[0])
-    return None
 
 
 def _find_word_targets(query: str, words: List[Dict[str, Any]]) -> List[Tuple[float, float, str]]:
@@ -401,15 +423,9 @@ def _ground_action(
     query: str,
     page: Optional[Dict[str, Any]],
     screenshot: Optional[Dict[str, Any]],
-    idx_in_shot: int,
-    count_in_shot: int,
 ) -> Optional[Dict[str, Any]]:
     if not screenshot:
         return None
-
-    box_pt = _color_box_target(screenshot, idx_in_shot, count_in_shot)
-    if box_pt:
-        return {"point": box_pt, "source": "annotation", "confidence": 0.95, "target_name": query}
 
     if query and screenshot.get("path"):
         ocr_hit = _find_ocr_target(query, screenshot["path"])
@@ -549,11 +565,6 @@ def build_tutorial_plan(
                 [min(n_shots - 1, (i * n_shots) // n_actions) for i in range(n_actions)]
                 if n_shots > 0 else [None] * n_actions
             )
-            counts: Dict[int, int] = {}
-            for s_idx in assigned_idx:
-                if s_idx is not None:
-                    counts[s_idx] = counts.get(s_idx, 0) + 1
-            running: Dict[int, int] = {}
 
             for i, (page, line) in enumerate(section_actions):
                 query = _target_query(line)
@@ -562,9 +573,7 @@ def build_tutorial_plan(
 
                 if s_idx is not None:
                     chosen_page, chosen_shot = section_shots[s_idx]
-                    idx_in_shot = running.get(s_idx, 0)
-                    running[s_idx] = idx_in_shot + 1
-                    grounding = _ground_action(query, chosen_page, chosen_shot, idx_in_shot, counts.get(s_idx, 1))
+                    grounding = _ground_action(query, chosen_page, chosen_shot)
 
                 # Validation / reassignment: the proportional guess is only
                 # a starting point. If it didn't confidently find the named
@@ -575,7 +584,7 @@ def build_tutorial_plan(
                     for alt_page, alt_shot in section_shots:
                         if alt_shot is chosen_shot:
                             continue
-                        alt_grounding = _ground_action(query, alt_page, alt_shot, 0, 1)
+                        alt_grounding = _ground_action(query, alt_page, alt_shot)
                         if alt_grounding and alt_grounding.get("source") != "none":
                             grounding = alt_grounding
                             chosen_page, chosen_shot = alt_page, alt_shot

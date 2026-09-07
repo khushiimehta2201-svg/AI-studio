@@ -152,56 +152,6 @@ def _page_words(page: "pymupdf.Page") -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# Colour annotation detection (explicit highlight boxes drawn by the author)
-# ---------------------------------------------------------------------------
-
-def _detect_colored_annotations(image_path: str) -> List[Tuple[float, float, float, float]]:
-    try:
-        img = cv2.imread(image_path)
-        if img is None:
-            return []
-        h, w = img.shape[:2]
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-
-        mask_red1 = cv2.inRange(hsv, np.array([0, 90, 90]), np.array([10, 255, 255]))
-        mask_red2 = cv2.inRange(hsv, np.array([165, 90, 90]), np.array([180, 255, 255]))
-        mask_orange = cv2.inRange(hsv, np.array([11, 100, 100]), np.array([26, 255, 255]))
-        mask = mask_red1 | mask_red2 | mask_orange
-
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        boxes = []
-        total_area = float(w * h)
-        for cnt in contours:
-            x, y, bw, bh = cv2.boundingRect(cnt)
-            frac = (bw * bh) / total_area
-            if not (0.0015 <= frac <= 0.40):
-                continue
-
-            aspect = (bw / float(bh)) if bh else 0.0
-            is_small = (bw / float(w) < 0.08) and (bh / float(h) < 0.15)
-            is_squarish = 0.7 <= aspect <= 1.4
-            extent = cv2.contourArea(cnt) / float(bw * bh) if bw and bh else 0.0
-            is_circle_fill = 0.55 <= extent <= 0.92
-            if is_small and is_squarish and is_circle_fill:
-                # Numbered step-circle markers (a common "1, 2, 3" callout
-                # style) sit NEXT TO the control they refer to, not on top
-                # of it -- using their position as the cursor point is what
-                # made the cursor land on the marker instead of the actual
-                # button/field. A genuine highlight box drawn around a
-                # control is bigger and rarely this close to square, so
-                # only that shape is trusted as a direct cursor target.
-                continue
-
-            boxes.append((x / w, y / h, (x + bw) / w, (y + bh) / h))
-
-        boxes.sort(key=lambda b: (b[1], b[0]))
-        return boxes
-    except Exception as e:
-        print(f"[PDF] annotation detection error: {e}")
-        return []
-
-
-# ---------------------------------------------------------------------------
 # Screenshot region extraction
 # ---------------------------------------------------------------------------
 
@@ -266,9 +216,6 @@ def _extract_page_screenshots(page: "pymupdf.Page", page_no: int, output_dir: Pa
         img_path = output_dir / f"page_{page_no:03d}_shot_{local_idx + 1:02d}.png"
         pix.save(str(img_path))
 
-        annotations = _detect_colored_annotations(str(img_path))
-        targets = [[(b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0] for b in annotations]
-
         screenshots.append({
             "page": page_no,
             "screenshot_index": local_idx + 1,
@@ -279,8 +226,6 @@ def _extract_page_screenshots(page: "pymupdf.Page", page_no: int, output_dir: Pa
             # to map a page-level word match into this screenshot's local
             # normalized space (see ai_service._map_page_point_to_screenshot).
             "page_rect": [clip.x0, clip.y0, clip.x1, clip.y1],
-            "targets": targets,
-            "primary_target": targets[0] if targets else None,
             "is_full_page": False,
         })
 
@@ -298,8 +243,6 @@ def _extract_page_screenshots_or_placeholder(page, page_no, output_dir):
         "width": 1280,
         "height": 720,
         "page_rect": None,
-        "targets": [],
-        "primary_target": None,
         "is_full_page": True,
     }]
 
