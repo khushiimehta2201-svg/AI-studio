@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+python-multipart
+jinja2
+python-dotenv
+numpy
+opencv-python
+pytesseract
+requests
+PyMuPDF
+Pillow
+imageio-ffmpeg
+kokoro
+soundfile
+torch

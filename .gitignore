@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+
+jobs/
+*.mp4
+*.wav
+*.webm
+
+*.log
+
+.idea/
+.vscode/
+
+.DS_Store
+Thumbs.db

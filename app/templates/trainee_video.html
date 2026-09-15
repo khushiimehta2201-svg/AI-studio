@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ video.title }} — Trainee portal</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <style>
+        .lock-overlay {
+            border: 2px dashed #d9dee5; border-radius: 12px;
+            padding: 60px 20px; text-align: center; margin-top: 18px;
+        }
+        .lock-overlay .icon { font-size: 34px; }
+        .watched-status {
+            font-size: 13px; color: #1f7a45; font-weight: 700; margin-top: 8px;
+            opacity: 0; transition: opacity .2s ease;
+        }
+        .watched-status.show { opacity: 1; }
+        .video-layout {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) 340px;
+            gap: 18px;
+            align-items: stretch;
+            margin-top: 18px;
+            width: 100%;
+            min-width: 0;
+        }
+        .video-pane { min-width: 0; max-width: 100%; aspect-ratio: 16 / 9; overflow: hidden; }
+        .video-pane video { display: block; width: 100%; max-width: 100%; height: 100%; object-fit: contain; background: #111820; }
+        .video-side { display: grid; grid-template-rows: minmax(0, 1fr) auto; gap: 18px; min-width: 0; min-height: 0; max-height: 100%; overflow-y: auto; padding-right: 4px; }
+        .video-side .card { margin-top: 0; }
+        .dialogue-box h2, .prereq-box h2 { font-size: 15px; }
+        .current-action { margin: 0 0 14px; padding: 12px; border-left: 3px solid #087ea4; background: #eef8fb; }
+        .current-action strong { display: block; margin-bottom: 3px; }
+        .current-action span { color: #66717d; font-size: 13px; }
+        .steps-list { margin: 0; padding-left: 20px; }
+        .steps-list li.active { color: #087ea4; font-weight: 750; }
+        .steps-list li { margin-bottom: 6px; }
+        .prereq-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+        .prereq-list li a { border: none; padding: 0; font-weight: normal; }
+        .prereq-done { color: #1f7a45; }
+        .prereq-pending { color: #1e242b; }
+        .prereq-list .tutorial-name { font-size: 11px; color: #7b8590; margin-left: 6px; }
+    </style>
+</head>
+<body>
+<div class="shell">
+    <header>
+        <div>
+            <small>TRAINEE PORTAL</small>
+            <h1>{{ video.title }}</h1>
+            <p>From "{{ video.tutorial_title }}"</p>
+        </div>
+    </header>
+
+    <p><a href="/trainee">&larr; Back to all videos</a></p>
+
+    <div class="video-layout">
+        <div class="video-pane">
+            {% if locked %}
+            <div class="lock-overlay">
+                <div class="icon">&#128274;</div>
+                <p><strong>This video is locked.</strong></p>
+                <p>Watch the prerequisite video(s) below first.</p>
+            </div>
+            {% else %}
+            <video id="player" controls preload="metadata" data-jid="{{ video.jid }}" data-section-id="{{ video.id }}" data-timeline='{{ video.dialogue_timeline | tojson }}'>
+                <source src="/trainee/videos/{{ video.jid }}/{{ video.id }}/stream" type="video/mp4">
+                {% if video.captions_url %}
+                <track kind="captions" src="{{ video.captions_url }}" default>
+                {% endif %}
+                Your browser does not support the video tag.
+            </video>
+            <p id="watched-status" class="watched-status {{ 'show' if already_watched else '' }}">&#10003; Marked as watched</p>
+            {% endif %}
+        </div>
+
+        <aside class="video-side">
+            <section class="card dialogue-box">
+                <h2>Actions performed in this video</h2>
+                <div id="current-action" class="current-action">
+                    <strong>Preparing the current action...</strong>
+                    <span>Play the video to follow each highlighted step.</span>
+                </div>
+                {% if video.action_bullets %}
+                <ol id="steps-list" class="steps-list">
+                    {% for step in video.action_bullets %}
+                    <li data-step-index="{{ loop.index0 }}">{{ step }}</li>
+                    {% endfor %}
+                </ol>
+                {% else %}
+                <p class="empty-note">No step-by-step breakdown was available for this video.</p>
+                {% endif %}
+            </section>
+
+            <section class="card prereq-box">
+                <h2>Prerequisites</h2>
+                {% if not prerequisites %}
+                <p class="empty-note">This video has no prerequisites — it's a great place to start.</p>
+                {% else %}
+                <ul class="prereq-list">
+                    {% for p in prerequisites %}
+                    <li class="{{ 'prereq-done' if p.watched else 'prereq-pending' }}">
+                        <a href="/trainee/videos/{{ p.jid }}/{{ p.id }}">
+                            {% if p.watched %}&#10003;{% else %}&#9675;{% endif %} {{ p.title }}
+                        </a>
+                        <span class="tutorial-name">{{ p.tutorial_title }}</span>
+                    </li>
+                    {% endfor %}
+                </ul>
+                {% endif %}
+            </section>
+        </aside>
+    </div>
+</div>
+
+<style>
+    @media (max-width: 820px) {
+        .video-layout { grid-template-columns: minmax(0, 1fr); }
+        .video-side { max-height: none; overflow: visible; }
+    }
+</style>
+
+{% if not locked %}
+<script>
+(function () {
+    const player = document.getElementById("player");
+    if (!player) return;
+    const jid = player.dataset.jid;
+    const sectionId = player.dataset.sectionId;
+    const statusEl = document.getElementById("watched-status");
+    const currentAction = document.getElementById("current-action");
+    const stepItems = Array.from(document.querySelectorAll("#steps-list li"));
+    let timeline = [];
+    try { timeline = JSON.parse(player.dataset.timeline || "[]"); } catch (err) { timeline = []; }
+
+    function updateDialogue() {
+        if (!timeline.length || !currentAction) return;
+        const now = player.currentTime || 0;
+        let activeIndex = timeline.findIndex((item) => now >= Number(item.start || 0) && now < Number(item.end || 0));
+        if (activeIndex < 0 && now >= Number(timeline[timeline.length - 1].start || 0)) activeIndex = timeline.length - 1;
+        if (activeIndex < 0) return;
+        const item = timeline[activeIndex];
+        currentAction.querySelector("strong").textContent = item.current_action || item.title || "Current action";
+        currentAction.querySelector("span").textContent = item.brief || "Follow the highlighted control and continue.";
+        stepItems.forEach((step, index) => step.classList.toggle("active", index === activeIndex));
+    }
+
+    async function markWatched() {
+        try {
+            const res = await fetch(`/trainee/videos/${jid}/${sectionId}/watch`, { method: "POST" });
+            if (res.ok && statusEl) statusEl.classList.add("show");
+        } catch (err) {
+            console.error("Could not record watch progress:", err);
+        }
+    }
+
+    player.addEventListener("ended", markWatched);
+    player.addEventListener("timeupdate", updateDialogue);
+    player.addEventListener("loadedmetadata", updateDialogue);
+
+    let markedByProgress = false;
+    player.addEventListener("timeupdate", () => {
+        if (markedByProgress || !player.duration) return;
+        if (player.currentTime / player.duration >= 0.9) {
+            markedByProgress = true;
+            markWatched();
+        }
+    });
+})();
+</script>
+{% endif %}
+</body>
+</html>

@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Trainer library — Teamcenter AI Studio</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <style>
+        .video-row {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 16px;
+            padding: 16px 0;
+            border-bottom: 1px solid #e7ebef;
+        }
+        .video-row:last-child { border-bottom: none; }
+        .video-preview { width: 280px; flex: 0 0 280px; }
+        .preview-frame { position: relative; }
+        .video-preview video { display: block; width: 100%; aspect-ratio: 16 / 9; border-radius: 8px; background: #111820; }
+        .fullscreen-preview { position: absolute; right: 8px; bottom: 38px; width: auto; margin: 0; padding: 6px 9px; font-size: 12px; }
+        .video-preview small { display: block; margin-top: 5px; color: #7b8590; font-size: 11px; }
+        .video-row h3 { margin: 0 0 4px; font-size: 16px; }
+        .video-row .tutorial-name { font-size: 12px; color: #7b8590; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; }
+        .row-actions { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
+        .row-actions form { margin: 0; }
+        .row-actions button, .row-actions a {
+            width: auto; margin: 0; padding: 8px 14px; font-size: 13px;
+        }
+        .status-pill {
+            font-size: 11px; font-weight: 800; letter-spacing: .5px;
+            padding: 4px 10px; border-radius: 99px;
+        }
+        .status-published { background: #eafaf0; color: #1f7a45; }
+        .status-draft { background: #f2f2f2; color: #7b8590; }
+        .prereq-list { margin: 8px 0 0; padding-left: 18px; font-size: 12px; color: #7b8590; }
+        details.prereq-editor { margin-top: 10px; }
+        details.prereq-editor summary { cursor: pointer; font-size: 12px; color: #263b50; font-weight: 700; }
+        .prereq-checks { margin: 10px 0; display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+        .prereq-checks label { display: flex; align-items: center; gap: 8px; font-weight: normal; }
+        .empty-note { color: #7b8590; font-size: 14px; }
+    </style>
+</head>
+<body>
+<div class="shell">
+    <header>
+        <div>
+            <small>TRAINER PORTAL</small>
+            <h1>Publish &amp; set prerequisites</h1>
+            <p>Every generated video below is visible only to trainees once you publish it. Prerequisites are set here and only here.</p>
+        </div>
+        <b>LOCAL • PRIVATE</b>
+    </header>
+
+    <div class="row" style="margin-bottom: 16px;">
+        <a href="/">&larr; Generate a new tutorial</a>
+        <a href="/trainee">View trainee portal &rarr;</a>
+    </div>
+
+    <section class="card">
+        <h2>Generated videos</h2>
+        {% if not videos %}
+        <p class="empty-note">No videos yet — generate a tutorial from the home page first.</p>
+        {% else %}
+        {% for v in videos %}
+        <div class="video-row">
+            <div class="video-preview">
+                {% if v.video_url %}
+                <div class="preview-frame">
+                    <video controls preload="metadata" muted>
+                        <source src="{{ v.video_url }}" type="video/mp4">
+                    </video>
+                    <button type="button" class="fullscreen-preview" data-fullscreen-preview title="Open preview fullscreen">&#x26F6; Fullscreen</button>
+                </div>
+                <small>Preview before publishing</small>
+                {% else %}
+                <p class="empty-note">Video is still being generated.</p>
+                {% endif %}
+            </div>
+            <div>
+                <div class="tutorial-name">{{ v.tutorial_title }}</div>
+                <h3>{{ v.section_title }}</h3>
+                <span class="status-pill {{ 'status-published' if v.published else 'status-draft' }}">
+                    {{ 'Published to trainees' if v.published else 'Draft (hidden)' }}
+                </span>
+
+                {% if v.prerequisites %}
+                <ul class="prereq-list">
+                    {% for pid in v.prerequisites %}
+                    <li>{{ pid }}</li>
+                    {% endfor %}
+                </ul>
+                {% endif %}
+
+                <details class="prereq-editor">
+                    <summary>Edit prerequisites</summary>
+                    <form method="post" action="/trainer/prerequisites/{{ v.vid.split(':')[0] }}/{{ v.vid.split(':')[1] }}">
+                        <div class="prereq-checks">
+                            {% for other in all_videos %}
+                                {% if other.vid != v.vid %}
+                                <label>
+                                    <input type="checkbox" name="prerequisite_ids" value="{{ other.vid }}"
+                                        {% if other.vid in v.prerequisites %}checked{% endif %}>
+                                    {{ other.tutorial_title }} — {{ other.section_title }}
+                                </label>
+                                {% endif %}
+                            {% endfor %}
+                        </div>
+                        <button type="submit" style="width: auto;">Save prerequisites</button>
+                    </form>
+                </details>
+            </div>
+
+            <div class="row-actions">
+                <form method="post" action="/trainer/publish/{{ v.vid.split(':')[0] }}/{{ v.vid.split(':')[1] }}">
+                    <input type="hidden" name="published" value="{{ 'false' if v.published else 'true' }}">
+                    <button type="submit">{{ 'Unpublish' if v.published else 'Publish' }}</button>
+                </form>
+            </div>
+        </div>
+        {% endfor %}
+        {% endif %}
+    </section>
+</div>
+<script>
+document.querySelectorAll("[data-fullscreen-preview]").forEach((button) => {
+    button.addEventListener("click", () => {
+        const video = button.closest(".preview-frame").querySelector("video");
+        if (video.requestFullscreen) video.requestFullscreen();
+        else if (video.webkitEnterFullscreen) video.webkitEnterFullscreen();
+    });
+});
+</script>
+</body>
+</html>
