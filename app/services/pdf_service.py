@@ -1,10 +1,27 @@
 from pathlib import Path
+import re
 from typing import Any, Dict, List
+
 import fitz
+
+
+_URL_RE = re.compile(
+    r"(?<![\w@])(?:https?://|www\.)[^\s<>\]\[\"')]+",
+    flags=re.IGNORECASE,
+)
 
 
 def _clean_text(text: str) -> str:
     return " ".join((text or "").replace("\r", "\n").split())
+
+
+def _extract_urls(text: str) -> List[str]:
+    urls: List[str] = []
+    for match in _URL_RE.findall(str(text or "")):
+        url = match.rstrip(".,;:!?)]}")
+        if url and url not in urls:
+            urls.append(url)
+    return urls
 
 
 def _heading_from_text(text: str) -> str | None:
@@ -13,6 +30,8 @@ def _heading_from_text(text: str) -> str | None:
         return None
 
     # Prefer a short first line as a section/page heading.
+    # Do not assume that every short first line is non-action: ai_service.py
+    # independently decides whether the heading is also an instruction.
     first = lines[0]
     if len(first) <= 120:
         return first
@@ -20,12 +39,53 @@ def _heading_from_text(text: str) -> str | None:
     return None
 
 
+def _page_urls(page) -> List[str]:
+    """
+    Collect both visible URLs and hyperlink-only PDF annotations.
+
+    A URL is metadata, not narration content. The AI planner uses this field
+    to expose useful destinations in captions without sending them to TTS.
+    """
+    urls: List[str] = []
+
+    for url in _extract_urls(page.get_text("text") or ""):
+        if url not in urls:
+            urls.append(url)
+
+    try:
+        links = page.get_links()
+    except Exception:
+        links = []
+
+    for link in links:
+        if not isinstance(link, dict):
+            continue
+
+        uri = link.get("uri")
+        if not uri:
+            continue
+
+        uri = _clean_text(str(uri))
+        if not uri:
+            continue
+
+        # Only expose web URLs to the caption layer. Internal PDF destinations
+        # are navigation metadata rather than useful external URLs.
+        if uri.lower().startswith(("http://", "https://", "www.")):
+            if uri not in urls:
+                urls.append(uri)
+
+    return urls
+
+
 def process_pdf(pdf_path: str, output_dir: str | Path) -> Dict[str, Any]:
     """
     Extract text, page dimensions, word coordinates and embedded images
     from a PDF.
 
-    Output format is compatible with app.services.ai_service.build_tutorial_plan.
+    Output remains compatible with app.services.ai_service.build_tutorial_plan.
+    In addition, every page receives `urls`, containing visible and
+    hyperlink-only web URLs for caption/metadata use.
     """
     pdf_path = Path(pdf_path)
     output_dir = Path(output_dir)
@@ -44,7 +104,7 @@ def process_pdf(pdf_path: str, output_dir: str | Path) -> Dict[str, Any]:
             page_num = page_index + 1
 
             text = page.get_text("text") or ""
-            words_raw = page.get_text("words") or []
+            words_raw = page.get_text("words") or ""
 
             words = []
             for item in words_raw:
@@ -63,6 +123,8 @@ def process_pdf(pdf_path: str, output_dir: str | Path) -> Dict[str, Any]:
 
             rect = page.rect
 
+            page_urls = _page_urls(page)
+
             pages.append(
                 {
                     "page": page_num,
@@ -71,6 +133,7 @@ def process_pdf(pdf_path: str, output_dir: str | Path) -> Dict[str, Any]:
                     "width": float(rect.width),
                     "height": float(rect.height),
                     "words": words,
+                    "urls": page_urls,
                 }
             )
 
@@ -120,7 +183,6 @@ def process_pdf(pdf_path: str, output_dir: str | Path) -> Dict[str, Any]:
                     )
 
             # Full-page fallback.
-            # This is used by AI planning when there are no embedded screenshots.
             if not image_list:
                 try:
                     matrix = fitz.Matrix(1.5, 1.5)
@@ -142,7 +204,12 @@ def process_pdf(pdf_path: str, output_dir: str | Path) -> Dict[str, Any]:
                             "screenshot_index": 1,
                             "path": str(full_page_path),
                             "is_full_page": True,
-                            "page_rect": [0, 0, float(rect.width), float(rect.height)],
+                            "page_rect": [
+                                0,
+                                0,
+                                float(rect.width),
+                                float(rect.height),
+                            ],
                         }
                     )
                 except Exception as exc:

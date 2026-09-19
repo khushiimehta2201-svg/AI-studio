@@ -1,4 +1,5 @@
-﻿import json
+import json
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -7,6 +8,21 @@ import soundfile as sf
 
 
 SAMPLE_RATE = 24000
+
+_URL_RE = re.compile(
+    r"(?<![\w@])(?:https?://|www\.)[^\s<>\]\[\"')]+",
+    flags=re.IGNORECASE,
+)
+
+
+def _clean_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return re.sub(r"\s+", " ", str(value)).strip()
+
+
+def _remove_urls(text: str) -> str:
+    return _clean_text(_URL_RE.sub(" ", str(text or "")))
 
 
 def _extract_audio(result):
@@ -26,17 +42,13 @@ def _extract_audio(result):
     if result is None:
         return None
 
-    # Kokoro 0.9.4:
-    # result.output.audio
     output = getattr(result, "output", None)
 
     if output is not None:
         audio = getattr(output, "audio", None)
-
         if audio is not None:
             return audio
 
-    # Compatibility with older/different Kokoro result shapes.
     if isinstance(result, tuple):
         if len(result) >= 3:
             return result[-1]
@@ -54,21 +66,15 @@ def _extract_audio(result):
 
 
 def _to_numpy_audio(audio):
-    """
-    Convert Kokoro/PyTorch audio into a clean 1-D float32 NumPy array.
-    """
-
+    """Convert Kokoro/PyTorch audio into a clean 1-D float32 NumPy array."""
     if audio is None:
         return None
 
-    # Torch tensor
     if hasattr(audio, "detach"):
         try:
             audio = audio.detach().cpu().numpy()
         except Exception:
             pass
-
-    # Objects exposing numpy()
     elif hasattr(audio, "numpy"):
         try:
             audio = audio.numpy()
@@ -77,14 +83,14 @@ def _to_numpy_audio(audio):
 
     array = np.asarray(audio)
 
-    # Flatten safely.
-    # This avoids the "inhomogeneous shape" error from the old code.
     if array.dtype == object:
         flattened = []
-
         for item in array:
             try:
-                item_array = np.asarray(item, dtype=np.float32).reshape(-1)
+                item_array = np.asarray(
+                    item,
+                    dtype=np.float32,
+                ).reshape(-1)
                 flattened.append(item_array)
             except Exception:
                 continue
@@ -93,9 +99,11 @@ def _to_numpy_audio(audio):
             return None
 
         array = np.concatenate(flattened)
-
     else:
-        array = array.astype(np.float32, copy=False).reshape(-1)
+        array = array.astype(
+            np.float32,
+            copy=False,
+        ).reshape(-1)
 
     return array
 
@@ -105,10 +113,7 @@ def _kokoro_generate(
     output_path: Path,
     voice: str = "af_heart",
 ):
-    """
-    Generate a WAV file using Kokoro 0.9.4.
-    """
-
+    """Generate a URL-free WAV file using Kokoro 0.9.4."""
     try:
         from kokoro import KPipeline
     except Exception as exc:
@@ -116,12 +121,14 @@ def _kokoro_generate(
             f"Could not import Kokoro: {exc}"
         ) from exc
 
-    # English Kokoro pipeline.
-    pipeline = KPipeline(lang_code="a")
+    # Final defense: never allow a caption URL to reach speech synthesis.
+    text = _remove_urls(text)
+    if not text:
+        text = "Continue with the next step."
 
+    pipeline = KPipeline(lang_code="a")
     audio_chunks = []
 
-    # Kokoro 0.9.4 returns a generator of KPipeline.Result objects.
     results = pipeline(
         text,
         voice=voice,
@@ -130,7 +137,6 @@ def _kokoro_generate(
 
     for result in results:
         audio = _extract_audio(result)
-
         if audio is None:
             continue
 
@@ -142,17 +148,13 @@ def _kokoro_generate(
         audio_chunks.append(audio_array)
 
     if not audio_chunks:
-        raise RuntimeError(
-            "Kokoro produced no audio."
-        )
+        raise RuntimeError("Kokoro produced no audio.")
 
-    # Join all sentence/segment outputs into one WAV.
     audio = np.concatenate(audio_chunks).astype(
         np.float32,
         copy=False,
     )
 
-    # Protect against NaN/Inf values.
     audio = np.nan_to_num(
         audio,
         nan=0.0,
@@ -160,7 +162,6 @@ def _kokoro_generate(
         neginf=0.0,
     )
 
-    # Make sure output directory exists.
     output_path.parent.mkdir(
         parents=True,
         exist_ok=True,
@@ -186,25 +187,16 @@ def generate_narration(
     """
     Generate one WAV file for every tutorial action.
 
-    Output remains compatible with video_service.py:
-        {
-            "files": [...],
-            "audio_files": [...],
-            ...
-        }
+    Output remains compatible with video_service.py.
     """
-
     job_dir = Path(job_dir)
-
     audio_dir = job_dir / "audio"
-
     audio_dir.mkdir(
         parents=True,
         exist_ok=True,
     )
 
     steps = plan.get("steps", [])
-
     total = len(steps)
 
     if total == 0:
@@ -219,7 +211,9 @@ def generate_narration(
     files: List[Optional[str]] = []
 
     for index, step in enumerate(steps):
-
+        # tts_narration is intentionally preferred because it is guaranteed
+        # URL-free by ai_service.py. The defensive sanitizer below protects
+        # older/cached plans as well.
         text = (
             step.get("tts_narration")
             or step.get("narration")
@@ -227,69 +221,49 @@ def generate_narration(
             or step.get("title")
             or "Continue with the next step."
         )
-
-        text = str(text).strip()
+        text = _remove_urls(str(text).strip())
 
         if not text:
             text = "Continue with the next step."
 
         output_path = (
-            audio_dir /
-            f"step_{index + 1:04d}.wav"
+            audio_dir
+            / f"step_{index + 1:04d}.wav"
         )
 
         try:
-
-            # -------------------------------------------------
-            # CACHE
-            # -------------------------------------------------
             if (
                 output_path.exists()
                 and output_path.stat().st_size > 1000
             ):
-
-                files.append(
-                    str(output_path)
-                )
-
+                files.append(str(output_path))
                 print(
                     f"[TTS] Using cached audio "
                     f"for step {index + 1}/{total}"
                 )
-
             else:
-
                 generated = _kokoro_generate(
                     text=text,
                     output_path=output_path,
                     voice=voice,
                 )
-
-                files.append(
-                    str(generated)
-                )
-
+                files.append(str(generated))
                 print(
                     f"[TTS] Generated step "
                     f"{index + 1}/{total}"
                 )
 
         except Exception as exc:
-
             print(
                 f"[TTS] Failed step "
                 f"{index + 1}: {exc}"
             )
-
             files.append(None)
 
-        # Correct progress: 0 -> 100
         if progress_callback:
-
             progress = int(
                 ((index + 1) / total) * 100
             )
-
             progress_callback(
                 progress,
                 f"Generated narration "
@@ -304,11 +278,8 @@ def generate_narration(
         "count": len(files),
     }
 
-    # Save manifest.
     manifest_path = job_dir / "audio.json"
-
     try:
-
         manifest_path.write_text(
             json.dumps(
                 result,
@@ -317,9 +288,7 @@ def generate_narration(
             ),
             encoding="utf-8",
         )
-
     except Exception as exc:
-
         print(
             f"[TTS] Could not write "
             f"audio manifest: {exc}"
