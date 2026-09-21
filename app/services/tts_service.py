@@ -108,72 +108,43 @@ def _to_numpy_audio(audio):
     return array
 
 
-def _kokoro_generate(
-    text: str,
-    output_path: Path,
-    voice: str = "af_heart",
-):
-    """Generate a URL-free WAV file using Kokoro 0.9.4."""
+_PIPELINE_UNAVAILABLE = object()
+
+
+def _create_pipeline():
     try:
         from kokoro import KPipeline
+        return KPipeline(lang_code="a")
     except Exception as exc:
-        raise RuntimeError(
-            f"Could not import Kokoro: {exc}"
-        ) from exc
+        raise RuntimeError(f"Could not initialize Kokoro: {exc}") from exc
 
-    # Final defense: never allow a caption URL to reach speech synthesis.
+
+def _kokoro_generate(text: str, output_path: Path, voice: str = "af_heart", pipeline=None):
+    """Generate a URL-free WAV using a supplied/reused Kokoro pipeline."""
+    if pipeline is None:
+        pipeline = _create_pipeline()
+
     text = _remove_urls(text)
     if not text:
         text = "Continue with the next step."
 
-    pipeline = KPipeline(lang_code="a")
     audio_chunks = []
-
-    results = pipeline(
-        text,
-        voice=voice,
-        speed=1,
-    )
-
-    for result in results:
+    for result in pipeline(text, voice=voice, speed=1):
         audio = _extract_audio(result)
         if audio is None:
             continue
-
         audio_array = _to_numpy_audio(audio)
-
         if audio_array is None or audio_array.size == 0:
             continue
-
         audio_chunks.append(audio_array)
 
     if not audio_chunks:
         raise RuntimeError("Kokoro produced no audio.")
 
-    audio = np.concatenate(audio_chunks).astype(
-        np.float32,
-        copy=False,
-    )
-
-    audio = np.nan_to_num(
-        audio,
-        nan=0.0,
-        posinf=0.0,
-        neginf=0.0,
-    )
-
-    output_path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    sf.write(
-        str(output_path),
-        audio,
-        SAMPLE_RATE,
-        subtype="PCM_16",
-    )
-
+    audio = np.concatenate(audio_chunks).astype(np.float32, copy=False)
+    audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    sf.write(str(output_path), audio, SAMPLE_RATE, subtype="PCM_16")
     return str(output_path)
 
 
@@ -184,91 +155,62 @@ def generate_narration(
     language: str = "en-us",
     voice: str = "af_heart",
 ) -> Dict[str, Any]:
-    """
-    Generate one WAV file for every tutorial action.
-
-    Output remains compatible with video_service.py.
-    """
+    """Generate one WAV per tutorial action while reusing one Kokoro pipeline per job."""
     job_dir = Path(job_dir)
     audio_dir = job_dir / "audio"
-    audio_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    audio_dir.mkdir(parents=True, exist_ok=True)
 
     steps = plan.get("steps", [])
     total = len(steps)
-
     if total == 0:
-        return {
-            "files": [],
-            "audio_files": [],
-            "language": language,
-            "voice": voice,
-            "count": 0,
-        }
+        return {"files": [], "audio_files": [], "language": language, "voice": voice, "count": 0}
 
     files: List[Optional[str]] = []
+    pipeline = None
+    pipeline_error: Optional[str] = None
+    pending_generation = any(
+        not (
+            (audio_dir / f"step_{index + 1:04d}.wav").exists()
+            and (audio_dir / f"step_{index + 1:04d}.wav").stat().st_size > 1000
+        )
+        for index in range(total)
+    )
+    if pending_generation:
+        try:
+            pipeline = _create_pipeline()
+        except Exception as exc:
+            pipeline_error = str(exc)
+            print(f"[TTS] Kokoro initialization failed: {exc}")
 
     for index, step in enumerate(steps):
-        # tts_narration is intentionally preferred because it is guaranteed
-        # URL-free by ai_service.py. The defensive sanitizer below protects
-        # older/cached plans as well.
         text = (
             step.get("tts_narration")
             or step.get("narration")
+            or step.get("caption_text")
             or step.get("caption")
             or step.get("title")
             or "Continue with the next step."
         )
-        text = _remove_urls(str(text).strip())
-
-        if not text:
-            text = "Continue with the next step."
-
-        output_path = (
-            audio_dir
-            / f"step_{index + 1:04d}.wav"
-        )
+        text = _remove_urls(str(text).strip()) or "Continue with the next step."
+        output_path = audio_dir / f"step_{index + 1:04d}.wav"
 
         try:
-            if (
-                output_path.exists()
-                and output_path.stat().st_size > 1000
-            ):
+            if output_path.exists() and output_path.stat().st_size > 1000:
                 files.append(str(output_path))
-                print(
-                    f"[TTS] Using cached audio "
-                    f"for step {index + 1}/{total}"
-                )
+                print(f"[TTS] Using cached audio for step {index + 1}/{total}")
+            elif pipeline is None:
+                files.append(None)
+                print(f"[TTS] Skipped step {index + 1}/{total}: {pipeline_error or 'Kokoro unavailable'}")
             else:
-                generated = _kokoro_generate(
-                    text=text,
-                    output_path=output_path,
-                    voice=voice,
-                )
+                generated = _kokoro_generate(text=text, output_path=output_path, voice=voice, pipeline=pipeline)
                 files.append(str(generated))
-                print(
-                    f"[TTS] Generated step "
-                    f"{index + 1}/{total}"
-                )
-
+                print(f"[TTS] Generated step {index + 1}/{total}")
         except Exception as exc:
-            print(
-                f"[TTS] Failed step "
-                f"{index + 1}: {exc}"
-            )
+            print(f"[TTS] Failed step {index + 1}: {exc}")
             files.append(None)
 
         if progress_callback:
-            progress = int(
-                ((index + 1) / total) * 100
-            )
-            progress_callback(
-                progress,
-                f"Generated narration "
-                f"{index + 1} of {total}",
-            )
+            progress_callback(int(((index + 1) / total) * 100), f"Generated narration {index + 1} of {total}")
 
     result = {
         "files": files,
@@ -276,32 +218,19 @@ def generate_narration(
         "language": language,
         "voice": voice,
         "count": len(files),
+        "successful": sum(1 for item in files if item),
     }
 
     manifest_path = job_dir / "audio.json"
     try:
-        manifest_path.write_text(
-            json.dumps(
-                result,
-                indent=2,
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
+        manifest_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
     except Exception as exc:
-        print(
-            f"[TTS] Could not write "
-            f"audio manifest: {exc}"
+        print(f"[TTS] Could not write audio manifest: {exc}")
+
+    print(f"[TTS] Completed: {result['successful']}/{total} audio files generated")
+    if result["successful"] == 0:
+        raise RuntimeError(
+            "Narration could not be generated for any step. "
+            + (pipeline_error or "Check the TTS configuration and voice model.")
         )
-
-    successful = sum(
-        1 for item in files
-        if item
-    )
-
-    print(
-        f"[TTS] Completed: "
-        f"{successful}/{total} audio files generated"
-    )
-
     return result
