@@ -1,115 +1,111 @@
+"""Pluggable TTS layer with local-first defaults.
+
+Supported:
+- sapi: Windows development/local fallback
+- kokoro: local neural TTS
+- azure: optional production cloud TTS
+"""
+from __future__ import annotations
+
 import os
+import re
 import subprocess
 import wave
+import html
 from pathlib import Path
 from typing import Any, Dict, List
+
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+load_dotenv(Path(__file__).resolve().parents[2]/".env")
 
-TTS_PROVIDER = os.getenv("TTS_PROVIDER", "sapi").strip().lower()
+PROVIDER=os.getenv("TTS_PROVIDER","sapi").strip().lower()
+_KOKORO_PIPELINES: dict[tuple[str,str], Any] = {}
 
 
-def wav_duration(path: str) -> float:
+def _clean(text:str)->str:
+    text=re.sub(r"https?://\S+|www\.\S+"," ",str(text or ""),flags=re.I)
+    text=re.sub(r"\s+"," ",text).strip()
+    return text[:1200] or "Continue with the next step."
+
+
+def wav_duration(path:str)->float:
     try:
-        with wave.open(str(path), "rb") as w:
-            return w.getnframes() / max(1.0, float(w.getframerate()))
-    except Exception:
-        return 0.0
+        with wave.open(path,"rb") as w:return w.getnframes()/max(1,float(w.getframerate()))
+    except Exception:return 0.0
 
 
-def _generate_windows_sapi(text: str, output_path: str) -> float:
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Sanitize text for PowerShell
-    clean_text = text.replace("'", " ").replace('"', ' ').replace("`", " ").strip()
-    if not clean_text:
-        clean_text = "Continuing to next step."
-
-    safe_output = str(output_path.resolve()).replace("'", "''")
-
-    ps_script = f"""
+def _sapi(text:str,out:Path)->float:
+    clean=_clean(text).replace("'"," ").replace('"',' ').replace("`"," ")
+    out.parent.mkdir(parents=True,exist_ok=True)
+    safe=str(out.resolve()).replace("'","''")
+    script=f"""
 Add-Type -AssemblyName System.Speech
-$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
-$synth.Rate = 0
-$synth.Volume = 100
-$synth.SetOutputToWaveFile('{safe_output}')
-$synth.Speak('{clean_text}')
-$synth.SetOutputToNull()
-$synth.Dispose()
+$s=New-Object System.Speech.Synthesis.SpeechSynthesizer
+$s.Rate=0
+$s.Volume=100
+$s.SetOutputToWaveFile('{safe}')
+$s.Speak('{clean}')
+$s.SetOutputToNull()
+$s.Dispose()
 """
-    result = subprocess.run(
-        ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=30,
-        text=True,
-    )
-
-    if result.returncode != 0:
-        raise RuntimeError(f"Windows SAPI error: {result.stderr.strip()}")
-
-    duration = wav_duration(str(output_path))
-    if duration <= 0.05:
-        raise RuntimeError("SAPI produced empty audio.")
-    return duration
+    r=subprocess.run(["powershell.exe","-NoProfile","-NonInteractive","-ExecutionPolicy","Bypass","-Command",script],capture_output=True,text=True,timeout=45)
+    if r.returncode!=0:raise RuntimeError(r.stderr.strip() or "SAPI failed")
+    d=wav_duration(str(out))
+    if d<=0.05:raise RuntimeError("SAPI produced empty audio")
+    return d
 
 
-def _generate_kokoro(text: str, output_path: str) -> float:
+def _kokoro(text:str,out:Path,voice:str)->float:
     import numpy as np
     import soundfile as sf
     from kokoro import KPipeline
+    lang=os.getenv("KOKORO_LANGUAGE","a")
+    key=(lang,voice)
+    pipe=_KOKORO_PIPELINES.get(key)
+    if pipe is None:
+        pipe=KPipeline(lang_code=lang)
+        _KOKORO_PIPELINES[key]=pipe
+    chunks=[audio for _,_,audio in pipe(_clean(text),voice=voice)]
+    if not chunks:raise RuntimeError("Kokoro returned no audio")
+    audio=np.concatenate(chunks) if len(chunks)>1 else chunks[0]
+    sf.write(str(out),audio,24000,subtype="PCM_16")
+    return wav_duration(str(out))
 
-    pipeline = KPipeline(lang_code="a")
-    segments = [audio for _, _, audio in pipeline(text, voice="af_heart")]
-    audio = np.concatenate(segments) if len(segments) > 1 else segments[0]
-    sf.write(str(output_path), audio, 24000, subtype="PCM_16")
-    return wav_duration(output_path)
+
+def _azure(text:str,out:Path,language:str="en-us")->float:
+    import requests
+    key=os.getenv("AZURE_SPEECH_KEY","").strip(); region=os.getenv("AZURE_SPEECH_REGION","").strip(); voice=os.getenv("AZURE_SPEECH_VOICE","hi-IN-SwaraNeural").strip()
+    if not key or not region:raise RuntimeError("Azure Speech credentials are not configured")
+    xml_lang="hi-IN" if str(language).lower() in {"hi","hi-in","hindi","hinglish"} else "en-US"
+    ssml=f'''<speak version="1.0" xml:lang="{xml_lang}"><voice name="{voice}">{html.escape(_clean(text))}</voice></speak>'''
+    url=f"https://{region}.tts.speech.microsoft.com/cognitiveservices/v1"
+    r=requests.post(url,headers={"Ocp-Apim-Subscription-Key":key,"Content-Type":"application/ssml+xml","X-Microsoft-OutputFormat":"riff-24khz-16bit-mono-pcm"},data=ssml.encode("utf-8"),timeout=60)
+    r.raise_for_status(); out.write_bytes(r.content); d=wav_duration(str(out))
+    if d<=0.05:raise RuntimeError("Azure returned empty audio")
+    return d
 
 
-def generate_narration(
-    plan: Dict[str, Any],
-    job_dir: str,
-    progress_callback=None,
-    language="en-us",
-    voice="af_heart",
-) -> List[Dict[str, Any]]:
-    job_dir = Path(job_dir)
-    out_dir = job_dir / "audio"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    steps = plan.get("steps", [])
-    if not steps:
-        return []
-
-    result = []
-    total = len(steps)
-
-    for i, step in enumerate(steps):
-        text = str(step.get("tts_narration") or step.get("narration") or "Next step.").strip()
-        wav_path = out_dir / f"step_{i:03d}.wav"
-
-        if progress_callback:
-            progress_callback(i, total, f"Synthesizing voice for scene {i + 1} of {total}")
-
+def generate_narration(plan:Dict[str,Any],job_dir:str,progress_callback=None,language:str="en-us",voice:str="af_heart")->List[Dict[str,Any]]:
+    out=Path(job_dir)/"audio"; out.mkdir(parents=True,exist_ok=True)
+    steps=plan.get("steps",[]); result=[]; total=len(steps)
+    actual_provider=PROVIDER
+    for i,step in enumerate(steps):
+        text=_clean(str(step.get("tts_narration") or step.get("narration") or "Continue with the next step."))
+        path=out/f"scene_{i+1:05d}.wav"
+        if progress_callback:progress_callback(i,total,f"Synthesizing narration {i+1} of {total}")
         try:
-            if TTS_PROVIDER == "sapi":
-                duration = _generate_windows_sapi(text, str(wav_path))
+            if actual_provider=="azure":duration=_azure(text,path,language)
+            elif actual_provider=="kokoro":duration=_kokoro(text,path,voice)
+            elif actual_provider=="sapi":duration=_sapi(text,path)
+            else:raise RuntimeError(f"Unsupported TTS_PROVIDER={actual_provider}")
+        except Exception as exc:
+            # Explicit provider never silently changes in production. SAPI is only
+            # a development fallback when AUTO_LOCAL_FALLBACK=true.
+            if os.getenv("AUTO_LOCAL_FALLBACK","false").lower() in {"1","true","yes","on"} and actual_provider!="sapi":
+                duration=_sapi(text,path); actual_provider="sapi"
             else:
-                duration = _generate_kokoro(text, str(wav_path))
-        except Exception as e:
-            print(f"[TTS] Error on step {i+1}: {e}. Retrying fallback SAPI...")
-            duration = _generate_windows_sapi(text, str(wav_path))
-
-        result.append({
-            "index": i,
-            "text": text,
-            "path": str(wav_path),
-            "duration": duration,
-        })
-
-    if progress_callback:
-        progress_callback(total, total, "Audio narration ready")
-
+                raise RuntimeError(f"TTS failed for scene {i+1}: {exc}") from exc
+        result.append({"index":i,"scene_id":step.get("scene_id"),"text":text,"path":str(path.resolve()),"duration":duration,"provider":actual_provider})
+    if progress_callback:progress_callback(total,total,"Narration audio ready")
     return result

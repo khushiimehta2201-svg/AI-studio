@@ -9,7 +9,8 @@ requests==2.32.4
 python-dotenv==1.1.1
 opencv-python==4.10.0.84
 numpy==1.26.4
+pytesseract==0.3.13
 
-# Optional local Kokoro TTS demo backend (Apache 2.0)
+# Optional local neural TTS demo
 kokoro==0.9.4
 soundfile==0.13.1

@@ -1,1196 +1,362 @@
-from pathlib import Path
+from __future__ import annotations
+
 import asyncio
+import hashlib
+import hmac
 import json
+import os
 import traceback
-from uuid import uuid4
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from uuid import uuid4
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import Cookie, FastAPI, File, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+BASE=Path(__file__).resolve().parent.parent
+load_dotenv(BASE/".env")
+JOBS=BASE/"jobs"; JOBS.mkdir(parents=True,exist_ok=True)
+STORE_PATH=BASE/"studio.sqlite3"
+MAX_MB=max(10,int(os.getenv("MAX_PDF_MB","200")))
+WORKERS=max(1,int(os.getenv("GENERATION_WORKERS","1")))
+AUTH_REQUIRED=os.getenv("AUTH_REQUIRED","true").lower() in {"1","true","yes","on"}
+AUTH_SECRET_VALUE=os.getenv("AUTH_SECRET","").strip()
+if AUTH_REQUIRED and (not AUTH_SECRET_VALUE or AUTH_SECRET_VALUE == "change-this-secret"):
+    raise RuntimeError("AUTH_REQUIRED=true requires a non-default AUTH_SECRET")
+AUTH_SECRET=AUTH_SECRET_VALUE.encode("utf-8") if AUTH_SECRET_VALUE else b"development-only-secret"
 
-# ============================================================
-# BASE CONFIGURATION
-# ============================================================
-
-BASE = Path(__file__).resolve().parent.parent
-
-load_dotenv(BASE / ".env")
-
-
-# ============================================================
-# EXISTING VIDEO GENERATION SERVICES
-# ============================================================
+def _job_dir(job_id:str)->Path:
+    return JOBS/job_id
 
 from app.services.pdf_service import process_pdf
-from app.services.ai_service import build_tutorial_plan
+from app.services.production_planner import build_tutorial_plan
+from app.services.portal_store import PortalStore
+from app.services.qa_service import validate_plan, validate_rendered_artifacts
 from app.services.tts_service import generate_narration
-from app.services.video_service import render
+from app.services.video_service import render_all_sections
+
+STORE=PortalStore(STORE_PATH)
+# Jobs cannot continue running across a process restart because the worker is process-local.
+# Mark unfinished work as interrupted rather than leaving the UI in a permanent "processing" state.
+for _row in STORE.list_jobs():
+    if _row.get("status") in {"queued","processing"} and not (_job_dir(_row["id"])/"tutorial.mp4").exists():
+        STORE.update_job(_row["id"],status="interrupted",message="Generation was interrupted by an application restart.")
+POOL=ThreadPoolExecutor(max_workers=WORKERS)
+INMEMORY_STATUS={}
+
+app=FastAPI(title="Teamcenter AI Studio Definitive",version="4.0")
+app.mount("/static",StaticFiles(directory=BASE/"app"/"static"),name="static")
+templates=Jinja2Templates(directory=str(BASE/"app"/"templates"))
 
 
-# ============================================================
-# DIRECTORIES
-# ============================================================
+def _session_token(username:str,role:str)->str:
+    payload=f"{username}:{role}".encode(); sig=hmac.new(AUTH_SECRET,payload,hashlib.sha256).hexdigest(); return f"{username}|{role}|{sig}"
 
-JOBS = BASE / "jobs"
-JOBS.mkdir(
-    parents=True,
-    exist_ok=True,
-)
-
-PORTAL_DATA = BASE / "portal_data.json"
-
-
-# ============================================================
-# JOB STATE
-# ============================================================
-
-jobs = {}
-
-pool = ThreadPoolExecutor(
-    max_workers=2
-)
-
-
-# ============================================================
-# FASTAPI APPLICATION
-# ============================================================
-
-app = FastAPI(
-    title="Teamcenter AI Studio v2"
-)
-
-
-# ============================================================
-# STATIC FILES
-# ============================================================
-
-app.mount(
-    "/static",
-    StaticFiles(
-        directory=BASE / "app" / "static"
-    ),
-    name="static",
-)
-
-
-app.mount(
-    "/media",
-    StaticFiles(
-        directory=JOBS
-    ),
-    name="media",
-)
-
-
-# ============================================================
-# TEMPLATES
-# ============================================================
-
-templates = Jinja2Templates(
-    directory=str(
-        BASE / "app" / "templates"
-    )
-)
-
-
-# ============================================================
-# PORTAL DATA HELPERS
-# ============================================================
-
-def load_portal_data():
-    """
-    Load portal-specific metadata.
-
-    The video-generation pipeline does not depend on this file.
-
-    Structure:
-
-    {
-        "published": {
-            "job_id": true
-        },
-        "prerequisites": {
-            "job_id": [
-                "https://example.com/video1"
-            ]
-        }
-    }
-    """
-
-    if not PORTAL_DATA.exists():
-        return {
-            "published": {},
-            "prerequisites": {},
-        }
-
+def _session(cookie:str|None):
+    if not AUTH_REQUIRED:return {"username":"local","role":"trainer"}
+    if not cookie:return None
     try:
-        data = json.loads(
-            PORTAL_DATA.read_text(
-                encoding="utf-8"
-            )
-        )
+        username,role,sig=cookie.split("|",2)
+        expected=hmac.new(AUTH_SECRET,f"{username}:{role}".encode(),hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig,expected):return None
+        return {"username":username,"role":role}
+    except Exception:return None
 
-        if not isinstance(data, dict):
-            raise ValueError(
-                "Invalid portal data"
-            )
+def _require(request:Request,role:str|None=None):
+    session=_session(request.cookies.get("ai_session"))
+    if not session:raise PermissionError("Authentication required")
+    if role and session.get("role")!=role:raise PermissionError("Insufficient permissions")
+    return session
 
-        data.setdefault(
-            "published",
-            {}
-        )
 
-        data.setdefault(
-            "prerequisites",
-            {}
-        )
-
-        return data
-
+def _safe_http_url(value:str)->bool:
+    import urllib.parse
+    try:
+        p=urllib.parse.urlparse(str(value).strip())
+        return p.scheme.lower() in {"http","https"} and bool(p.netloc)
     except Exception:
-        return {
-            "published": {},
-            "prerequisites": {},
-        }
-
-
-def save_portal_data(data):
-    """
-    Save trainer/portal metadata.
-
-    This is intentionally separate from the video-generation
-    files and pipeline.
-    """
-
-    PORTAL_DATA.write_text(
-        json.dumps(
-            data,
-            indent=2,
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
-
-
-# ============================================================
-# DISCOVER GENERATED VIDEOS
-# ============================================================
-
-def get_generated_videos():
-    """
-    Discover generated tutorials from the jobs directory.
-
-    A tutorial is considered available when:
-
-        jobs/<job_id>/tutorial.mp4
-        jobs/<job_id>/plan.json
-
-    both exist.
-
-    This means the trainee/trainer portal can continue to see
-    generated tutorials even after restarting FastAPI.
-    """
-
-    videos = []
-
-    if not JOBS.exists():
-        return videos
-
-    portal_data = load_portal_data()
-
-    published = portal_data.get(
-        "published",
-        {}
-    )
-
-    prerequisites = portal_data.get(
-        "prerequisites",
-        {}
-    )
-
-    for job_dir in JOBS.iterdir():
-
-        if not job_dir.is_dir():
-            continue
-
-        jid = job_dir.name
-
-        video_file = (
-            job_dir / "tutorial.mp4"
-        )
-
-        plan_file = (
-            job_dir / "plan.json"
-        )
-
-        if not video_file.exists():
-            continue
-
-        if not plan_file.exists():
-            continue
-
-        try:
-            plan = json.loads(
-                plan_file.read_text(
-                    encoding="utf-8"
-                )
-            )
-
-        except Exception:
-            plan = {}
-
-        if not isinstance(plan, dict):
-            plan = {}
-
-        title = plan.get(
-            "title",
-            "Teamcenter Tutorial",
-        )
-
-        description = plan.get(
-            "description",
-            "Interactive Teamcenter training tutorial.",
-        )
-
-        # By default, existing generated videos are visible.
-        # Once a trainer explicitly changes publication status,
-        # that value is used.
-        is_published = bool(
-            published.get(
-                jid,
-                True
-            )
-        )
-
-        video = {
-            "id": jid,
-            "job_id": jid,
-            "title": title,
-            "description": description,
-            "video_url": (
-                f"/media/{jid}/tutorial.mp4"
-            ),
-            "published": is_published,
-            "prerequisites": prerequisites.get(
-                jid,
-                [],
-            ),
-        }
-
-        videos.append(video)
-
-    # Newest job first
-    videos.sort(
-        key=lambda item: item["id"],
-        reverse=True,
-    )
-
-    return videos
-
-
-# ============================================================
-# BRIEF ACTION EXTRACTION
-# ============================================================
-
-def extract_brief_actions(plan):
-    """
-    Extract short action/topic points for the trainee portal.
-
-    IMPORTANT:
-    This does NOT expose the complete detailed procedure.
-
-    The trainee UI should show brief points describing what
-    happens in the tutorial.
-    """
-
-    actions = []
-
-    if not isinstance(plan, dict):
-        return actions
-
-    # --------------------------------------------------------
-    # Sections
-    # --------------------------------------------------------
-
-    sections = plan.get(
-        "sections",
-        []
-    )
-
-    if isinstance(sections, list):
-
-        for section in sections:
-
-            if not isinstance(section, dict):
-                continue
-
-            title = (
-                section.get("title")
-                or section.get("name")
-                or section.get("heading")
-            )
-
-            if title:
-                actions.append(
-                    str(title).strip()
-                )
-
-            section_actions = (
-                section.get("actions")
-                or section.get("steps")
-                or section.get("action_items")
-                or []
-            )
-
-            if isinstance(
-                section_actions,
-                list
-            ):
-
-                for action in section_actions:
-
-                    if isinstance(
-                        action,
-                        dict
-                    ):
-                        text = (
-                            action.get("caption")
-                            or action.get("action")
-                            or action.get("description")
-                            or action.get("text")
-                            or action.get("narration")
-                        )
-
-                    else:
-                        text = str(action)
-
-                    if text:
-                        actions.append(
-                            str(text).strip()
-                        )
-
-    # --------------------------------------------------------
-    # Direct actions
-    # --------------------------------------------------------
-
-    direct_actions = plan.get(
-        "actions",
-        []
-    )
-
-    if isinstance(
-        direct_actions,
-        list
-    ):
-
-        for action in direct_actions:
-
-            if isinstance(
-                action,
-                dict
-            ):
-                text = (
-                    action.get("caption")
-                    or action.get("action")
-                    or action.get("description")
-                    or action.get("text")
-                    or action.get("narration")
-                )
-
-            else:
-                text = str(action)
-
-            if text:
-                actions.append(
-                    str(text).strip()
-                )
-
-    # Older generated plans store their tutorial actions in steps.
-    if not actions:
-        steps = plan.get("steps", [])
-
-        if isinstance(steps, list):
-            for step in steps:
-                if isinstance(step, dict):
-                    text = (
-                        step.get("narration")
-                        or step.get("caption")
-                        or step.get("title")
-                        or step.get("content")
-                    )
-                else:
-                    text = str(step)
-
-                if text:
-                    actions.append(str(text).strip())
-
-    # --------------------------------------------------------
-    # Remove duplicates
-    # --------------------------------------------------------
-
-    cleaned = []
-
-    seen = set()
-
-    for item in actions:
-
-        item = " ".join(
-            item.split()
-        )
-
-        if len(item) > 150:
-            item = item[:147].rsplit(" ", 1)[0] + "..."
-
-        if not item:
-            continue
-
-        key = item.lower()
-
-        if key in seen:
-            continue
-
-        seen.add(key)
-
-        cleaned.append(item)
-
-    # Keep the trainee UI concise.
-    return cleaned[:8]
-
-
-# ============================================================
-# MAIN GENERATOR UI
-# ============================================================
-
-@app.get(
-    "/",
-    response_class=HTMLResponse
-)
-async def home(request: Request):
-
-    return templates.TemplateResponse(
-        request=request,
-        name="index.html",
-    )
-
-
-# ============================================================
-# TRAINEE PORTAL PAGE
-# ============================================================
-
-@app.get(
-    "/trainee",
-    response_class=HTMLResponse
-)
-async def trainee_portal(
-    request: Request
-):
-
-    return templates.TemplateResponse(
-        "trainee.html",
-        {
-            "request": request
-        }
-    )
-
-
-# ============================================================
-# TRAINEE WATCH PAGE
-# ============================================================
-
-@app.get(
-    "/trainee/videos/{video_id}",
-    response_class=HTMLResponse
-)
-async def trainee_watch_page(
-    request: Request,
-    video_id: str
-):
-
-    return templates.TemplateResponse(
-        "watch.html",
-        {
-            "request": request,
-            "video_id": video_id,
-        }
-    )
-
-
-# ============================================================
-# TRAINER PORTAL PAGE
-# ============================================================
-
-@app.get(
-    "/trainer",
-    response_class=HTMLResponse
-)
-async def trainer_portal(
-    request: Request
-):
-
-    return templates.TemplateResponse(
-        "trainer.html",
-        {
-            "request": request,
-        }
-    )
-
-
-# ============================================================
-# TRAINEE API
-# ============================================================
-
-@app.get(
-    "/api/trainee/videos"
-)
-async def trainee_videos():
-
-    videos = get_generated_videos()
-
-    # Only published tutorials appear to trainees.
-    videos = [
-        video
-        for video in videos
-        if video.get(
-            "published",
-            True
-        )
-    ]
-
-    return {
-        "videos": videos
-    }
-
-
-@app.get(
-    "/api/trainee/videos/{video_id}"
-)
-async def trainee_video_details(
-    video_id: str
-):
-
-    videos = get_generated_videos()
-
-    video = next(
-        (
-            item
-            for item in videos
-            if item["id"] == video_id
-        ),
-        None,
-    )
-
-    if video is None:
-
-        return JSONResponse(
-            {
-                "error": "Tutorial not found"
-            },
-            status_code=404,
-        )
-
-    if not video.get(
-        "published",
-        True
-    ):
-
-        return JSONResponse(
-            {
-                "error": "Tutorial is not published"
-            },
-            status_code=404,
-        )
-
-    plan_file = (
-        JOBS
-        / video_id
-        / "plan.json"
-    )
-
+        return False
+
+
+def _update(job_id:str,**fields):
+    INMEMORY_STATUS.setdefault(job_id,{})
+    INMEMORY_STATUS[job_id].update(fields)
+    mapped={k:v for k,v in fields.items() if k in {"status","progress","message","error","filename"}}
+    if mapped:
+        STORE.update_job(job_id,**mapped)
+
+
+def discover_videos()->list[dict]:
+    out=[]
+    for row in STORE.list_jobs():
+        jid=row["id"]; plan=STORE.get_plan(jid) or {}
+        if not (_job_dir(jid)/"tutorial.mp4").exists():continue
+        out.append({"id":jid,"job_id":jid,"title":plan.get("title","Teamcenter Tutorial"),"description":plan.get("description","Guided software training tutorial."),"video_url":f"/media/trainee/{jid}/tutorial.mp4","preview_url":f"/media/trainer/{jid}/tutorial.mp4","captions_url":f"/media/trainee/{jid}/tutorial.vtt","published":row.get("publication_status")=="published","publication_status":row.get("publication_status","draft"),"requires_trainer_review":bool(plan.get("requires_trainer_review")),"qa":plan.get("qa",{}),"action_count":plan.get("action_count",0),"total_pages":plan.get("total_pages",0),"created_at":row.get("created_at")})
+    return out
+
+
+@app.get("/",response_class=HTMLResponse)
+async def home(request:Request):return templates.TemplateResponse(request=request,name="index.html")
+@app.get("/login",response_class=HTMLResponse)
+async def login_page(request:Request):return templates.TemplateResponse(request=request,name="login.html")
+@app.post("/login")
+async def login(request:Request):
+    body=await request.json(); user=str(body.get("username","")).strip(); password=str(body.get("password","")).strip()
+    trainer_user=os.getenv("TRAINER_USERNAME","").strip(); trainer_pass=os.getenv("TRAINER_PASSWORD","")
+    trainee_user=os.getenv("TRAINEE_USERNAME","").strip(); trainee_pass=os.getenv("TRAINEE_PASSWORD","")
+    trainer_ok=bool(trainer_user and trainer_pass) and user==trainer_user and hmac.compare_digest(password,trainer_pass)
+    trainee_ok=bool(trainee_user and trainee_pass) and user==trainee_user and hmac.compare_digest(password,trainee_pass)
+    if not(trainer_ok or trainee_ok):return JSONResponse({"error":"Invalid credentials"},status_code=401)
+    role="trainer" if trainer_ok else "trainee"; response=JSONResponse({"success":True,"role":role}); response.set_cookie("ai_session",_session_token(user,role),httponly=True,samesite="lax",secure=os.getenv("COOKIE_SECURE","false").lower() in {"1","true","yes","on"},max_age=8*3600)
+    return response
+@app.post("/logout")
+async def logout():
+    response=JSONResponse({"success":True});response.delete_cookie("ai_session");return response
+
+@app.get("/trainee",response_class=HTMLResponse)
+async def trainee_page(request:Request):
+    try:_require(request,"trainee")
+    except PermissionError:
+        if AUTH_REQUIRED:return RedirectResponse("/login")
+    return templates.TemplateResponse(request=request,name="trainee.html")
+@app.get("/trainer",response_class=HTMLResponse)
+async def trainer_page(request:Request):
+    try:_require(request,"trainer")
+    except PermissionError:
+        if AUTH_REQUIRED:return RedirectResponse("/login")
+    return templates.TemplateResponse(request=request,name="trainer.html")
+@app.get("/trainee/videos/{video_id}",response_class=HTMLResponse)
+async def watch_page(request:Request,video_id:str):
+    try:_require(request,"trainee")
+    except PermissionError:
+        if AUTH_REQUIRED:return RedirectResponse("/login")
+    return templates.TemplateResponse("watch.html",{"request":request,"video_id":video_id})
+
+@app.get("/health")
+async def health():return {"status":"ok","service":"Teamcenter AI Studio","schema_version":4,"workers":WORKERS}
+
+@app.post("/generate")
+async def generate(request:Request,file:UploadFile=File(...)):
+    try:_require(request,"trainer")
+    except PermissionError:
+        if AUTH_REQUIRED:return JSONResponse({"error":"Authentication required"},status_code=401)
+    if not(file.filename or "").lower().endswith(".pdf"):return JSONResponse({"error":"Please upload a PDF."},status_code=400)
+    jid=uuid4().hex[:12]; job=_job_dir(jid);job.mkdir(parents=True,exist_ok=True);pdf=job/"source.pdf"
+    total=0; limit=MAX_MB*1024*1024
     try:
-
-        plan = json.loads(
-            plan_file.read_text(
-                encoding="utf-8"
-            )
-        )
-
+        with pdf.open("wb") as fh:
+            while True:
+                chunk=await file.read(1024*1024)
+                if not chunk:break
+                total+=len(chunk)
+                if total>limit:
+                    fh.close();pdf.unlink(missing_ok=True)
+                    job.rmdir()
+                    return JSONResponse({"error":f"PDF exceeds {MAX_MB} MB."},status_code=413)
+                fh.write(chunk)
     except Exception:
-
-        plan = {}
-
-    if not isinstance(
-        plan,
-        dict
-    ):
-        plan = {}
-
-    actions = extract_brief_actions(
-        plan
-    )
-
-    topic_intro = (
-        plan.get(
-            "description"
-        )
-        or "This tutorial provides a guided walkthrough of the selected Teamcenter topic."
-    )
-
-    return {
-        **video,
-        "actions": actions,
-        "topic_intro": topic_intro,
-    }
-
-
-# ============================================================
-# TRAINER API
-# ============================================================
-
-@app.get(
-    "/api/trainer/videos"
-)
-async def trainer_videos():
-
-    return {
-        "videos": get_generated_videos()
-    }
-
-
-# ============================================================
-# PUBLISH / UNPUBLISH TUTORIAL
-# ============================================================
-
-@app.post(
-    "/api/trainer/publish/{video_id}"
-)
-async def trainer_publish(
-    video_id: str
-):
-
-    videos = get_generated_videos()
-
-    video = next(
-        (
-            item
-            for item in videos
-            if item["id"] == video_id
-        ),
-        None,
-    )
-
-    if video is None:
-
-        return JSONResponse(
-            {
-                "error": "Tutorial not found"
-            },
-            status_code=404,
-        )
-
-    data = load_portal_data()
-
-    current = bool(
-        data
-        .get("published", {})
-        .get(
-            video_id,
-            True
-        )
-    )
-
-    new_value = not current
-
-    data.setdefault(
-        "published",
-        {}
-    )[video_id] = new_value
-
-    save_portal_data(data)
-
-    return {
-        "success": True,
-        "published": new_value,
-        "video_id": video_id,
-    }
-
-
-# ============================================================
-# TRAINER PREREQUISITES
-# ============================================================
-
-@app.post(
-    "/api/trainer/prerequisites/{video_id}"
-)
-async def trainer_prerequisites(
-    video_id: str,
-    request: Request,
-):
-
-    videos = get_generated_videos()
-
-    video = next(
-        (
-            item
-            for item in videos
-            if item["id"] == video_id
-        ),
-        None,
-    )
-
-    if video is None:
-
-        return JSONResponse(
-            {
-                "error": "Tutorial not found"
-            },
-            status_code=404,
-        )
-
+        import shutil
+        shutil.rmtree(job,ignore_errors=True)
+        raise
     try:
-
-        body = await request.json()
-
+        with pdf.open("rb") as fh:
+            magic=fh.read(5)
+        if pdf.stat().st_size < 5 or magic != b"%PDF-":
+            import shutil; shutil.rmtree(job,ignore_errors=True)
+            return JSONResponse({"error":"Uploaded file is not a valid PDF."},status_code=400)
     except Exception:
+        import shutil; shutil.rmtree(job,ignore_errors=True)
+        return JSONResponse({"error":"Unable to validate uploaded PDF."},status_code=400)
+    STORE.create_job(jid,file.filename or "source.pdf");_update(jid,status="queued",progress=2,message="PDF uploaded",filename=file.filename or "source.pdf")
+    asyncio.get_running_loop().run_in_executor(POOL,run_job,jid,pdf)
+    return {"job_id":jid}
 
-        body = {}
+@app.get("/status/{jid}")
+async def status(request:Request,jid:str):
+    try:_require(request,"trainer")
+    except PermissionError:
+        if AUTH_REQUIRED:return JSONResponse({"error":"Authentication required"},status_code=401)
+    stored=STORE.get_job(jid)
+    if not stored:return JSONResponse({"error":"Job not found"},status_code=404)
+    payload={"job_id":jid,"status":stored.get("status"),"progress":stored.get("progress",0),"message":stored.get("message",""),"error":stored.get("error")}
+    plan=STORE.get_plan(jid)
+    if plan:
+        payload["title"]=plan.get("title");payload["requires_trainer_review"]=plan.get("requires_trainer_review",True)
+    if (_job_dir(jid)/"tutorial.mp4").exists():payload["video_url"]=f"/media/trainer/{jid}/tutorial.mp4"
+    return payload
 
-    urls = body.get(
-        "prerequisites",
-        body.get(
-            "urls",
-            []
-        )
-    )
+@app.get("/api/trainee/videos")
+async def trainee_videos(request:Request):
+    try:_require(request,"trainee")
+    except PermissionError:
+        if AUTH_REQUIRED:return JSONResponse({"error":"Authentication required"},status_code=401)
+    return {"videos":[v for v in discover_videos() if v["published"]]}
 
-    if isinstance(
-        urls,
-        str
-    ):
-        urls = [urls]
+@app.get("/api/trainee/videos/{jid}")
+async def trainee_details(request:Request,jid:str):
+    try:_require(request,"trainee")
+    except PermissionError:
+        if AUTH_REQUIRED:return JSONResponse({"error":"Authentication required"},status_code=401)
+    video=next((v for v in discover_videos() if v["id"]==jid and v["published"]),None)
+    if not video:return JSONResponse({"error":"Tutorial not found"},status_code=404)
+    plan=STORE.get_plan(jid) or {}
+    return {**video,"topic_intro":plan.get("description","Guided software training tutorial."),"actions":[{"scene_id":s.get("scene_id"),"title":s.get("title"),"source_step_number":s.get("source_step_number"),"start":next((x.get("start") for x in plan.get("dialogue_timeline",[]) if x.get("scene_id")==s.get("scene_id")),None),"end":next((x.get("end") for x in plan.get("dialogue_timeline",[]) if x.get("scene_id")==s.get("scene_id")),None)} for s in plan.get("steps",[]) if s.get("kind")=="action"],"timeline":plan.get("dialogue_timeline",[]),"sections":plan.get("sections",[]),"prerequisites":STORE.prerequisites(jid)}
 
-    if not isinstance(
-        urls,
-        list
-    ):
-        urls = []
+@app.get("/api/trainer/videos")
+async def trainer_videos(request:Request):
+    try:_require(request,"trainer")
+    except PermissionError:
+        if AUTH_REQUIRED:return JSONResponse({"error":"Authentication required"},status_code=401)
+    return {"videos":discover_videos()}
 
-    cleaned = []
+@app.get("/api/trainer/videos/{jid}/review")
+async def trainer_review(request:Request,jid:str):
+    try:_require(request,"trainer")
+    except PermissionError:
+        if AUTH_REQUIRED:return JSONResponse({"error":"Authentication required"},status_code=401)
+    plan=STORE.get_plan(jid)
+    if not plan:return JSONResponse({"error":"Tutorial not found"},status_code=404)
+    return {"job_id":jid,"title":plan.get("title"),"steps":plan.get("steps",[]),"qa":plan.get("qa",{}),"reviews":STORE.reviews(jid)}
 
-    for url in urls:
+@app.post("/api/trainer/scenes/{jid}/{scene_id}/review")
+async def review_scene(request:Request,jid:str,scene_id:str):
+    try:_require(request,"trainer")
+    except PermissionError:
+        if AUTH_REQUIRED:return JSONResponse({"error":"Authentication required"},status_code=401)
+    plan=STORE.get_plan(jid)
+    if not plan:return JSONResponse({"error":"Tutorial not found"},status_code=404)
+    body=await request.json(); action=str(body.get("decision","")); scene=next((s for s in plan.get("steps",[]) if s.get("scene_id")==scene_id),None)
+    if not scene:return JSONResponse({"error":"Scene not found"},status_code=404)
+    if action=="approve_target":
+        point=scene.get("cursor")
+        valid_point=isinstance(point,list) and len(point)==2 and all(isinstance(v,(int,float)) and 0<=float(v)<=1 for v in point)
+        if scene.get("interaction")!="none" and not valid_point:
+            return JSONResponse({"error":"Cannot approve a target without a valid cursor point."},status_code=409)
+        if scene.get("interaction")=="drag" and not(isinstance(scene.get("cursor_path"),list) and len(scene.get("cursor_path"))>=2):
+            return JSONResponse({"error":"A drag target requires both a start and end point."},status_code=409)
+        scene["target_status"]="verified";scene["target_review_required"]=False;scene["cursor_enabled"]=scene.get("interaction")!="none";scene["cursor_source"]="trainer_approved";scene["cursor_confidence"]=1.0
+        STORE.review(jid,scene_id,"approved","")
+    elif action=="set_target":
+        point=body.get("point");points=body.get("points");box=body.get("bounding_box")
+        if scene.get("interaction")=="drag":
+            if not(isinstance(points,list) and len(points)>=2):return JSONResponse({"error":"drag targets must provide points=[[start_x,start_y],[end_x,end_y]]"},status_code=400)
+            if any(not(isinstance(x,(list,tuple)) and len(x)==2 and all(0<=float(v)<=1 for v in x)) for x in points[:2]):return JSONResponse({"error":"drag points must be normalized 0..1"},status_code=400)
+            norm_points=[[float(v) for v in x] for x in points[:2]]
+            scene.update({"cursor":norm_points[-1],"cursor_path":norm_points,"cursor_bounding_box":box,"target_status":"verified","target_review_required":False,"cursor_enabled":True,"cursor_source":"trainer","cursor_confidence":1.0})
+            STORE.review(jid,scene_id,"target_set",str(norm_points))
+        else:
+            if not(isinstance(point,list) and len(point)==2):return JSONResponse({"error":"point must be [x,y] in normalized coordinates"},status_code=400)
+            if any(float(x)<0 or float(x)>1 for x in point):return JSONResponse({"error":"point must be normalized 0..1"},status_code=400)
+            norm_point=[float(point[0]),float(point[1])]
+            scene.update({"cursor":norm_point,"cursor_path":[norm_point],"cursor_bounding_box":box,"target_status":"verified","target_review_required":False,"cursor_enabled":scene.get("interaction")!="none","cursor_source":"trainer","cursor_confidence":1.0})
+            STORE.review(jid,scene_id,"target_set",str(norm_point))
+    elif action=="mark_no_target":
+        # Record the observation without treating a required visual target as resolved.
+        scene.update({"cursor":None,"cursor_bounding_box":None,"cursor_path":[],"cursor_enabled":False,"target_status":"unresolved","target_review_required":True,"cursor_source":"trainer_no_target"})
+        STORE.review(jid,scene_id,"no_target","Trainer could not identify a trustworthy target; scene remains blocked from publication.")
+    else:return JSONResponse({"error":"decision must be approve_target, set_target, or mark_no_target"},status_code=400)
+    # Re-render from stored audio and re-run QA after every review change.
+    ( _job_dir(jid)/"plan.json").write_text(json.dumps(plan,indent=2,ensure_ascii=False),encoding="utf-8")
+    audio=[]
+    audio_path=_job_dir(jid)/"audio.json"
+    if audio_path.exists():audio=json.loads(audio_path.read_text(encoding="utf-8"))
+    pre=validate_plan(plan)
+    result=render_all_sections(plan,audio,str(_job_dir(jid)))
+    post=validate_rendered_artifacts(str(_job_dir(jid)),result)
+    plan["qa"]={"pre_render":pre,"post_render":post,"publishable":bool(pre.get("publishable")) and bool(post.get("publishable")) and not any(s.get("target_review_required") for s in plan.get("steps",[]))}
+    plan["requires_trainer_review"]=not plan["qa"]["publishable"]
+    STORE.set_plan(jid,plan);STORE.update_job(jid,publication_status="draft")
+    return {"success":True,"scene":scene,"publishable":plan["qa"]["publishable"]}
 
-        url = str(
-            url
-        ).strip()
+@app.post("/api/trainer/publish/{jid}")
+async def publish(request:Request,jid:str):
+    try:_require(request,"trainer")
+    except PermissionError:
+        if AUTH_REQUIRED:return JSONResponse({"error":"Authentication required"},status_code=401)
+    plan=STORE.get_plan(jid)
+    if not plan:return JSONResponse({"error":"Tutorial not found"},status_code=404)
+    body=await request.json() if request.headers.get("content-type","").startswith("application/json") else {}
+    desired=bool(body.get("published",not(STORE.get_job(jid) or {}).get("publication_status")=="published"))
+    if desired:
+        qa=plan.get("qa",{}); unresolved=[s.get("scene_id") for s in plan.get("steps",[]) if s.get("target_review_required")]
+        if not qa.get("publishable") or unresolved:return JSONResponse({"error":"Tutorial has not passed QA/review.","review_required":unresolved,"qa":qa},status_code=409)
+        STORE.set_publication(jid,"published")
+    else:STORE.set_publication(jid,"draft")
+    return {"success":True,"published":desired}
 
-        if not url:
-            continue
+@app.post("/api/trainer/prerequisites/{jid}")
+async def prerequisites(request:Request,jid:str):
+    try:_require(request,"trainer")
+    except PermissionError:
+        if AUTH_REQUIRED:return JSONResponse({"error":"Authentication required"},status_code=401)
+    if not STORE.get_job(jid):return JSONResponse({"error":"Tutorial not found"},status_code=404)
+    body=await request.json();urls=body.get("prerequisites",[]);urls=[urls] if isinstance(urls,str) else urls if isinstance(urls,list) else []
+    cleaned=[]
+    invalid=[]
+    for u in urls:
+        value=str(u).strip()
+        if not value: continue
+        if _safe_http_url(value): cleaned.append(value)
+        else: invalid.append(value)
+    urls=list(dict.fromkeys(cleaned))
+    if invalid:return JSONResponse({"error":"Prerequisite URLs must use http:// or https://.","invalid":invalid},status_code=400)
+    STORE.set_prerequisites(jid,urls);return {"success":True,"prerequisites":urls}
 
-        if url not in cleaned:
-            cleaned.append(url)
+@app.get("/media/trainer/{jid}/scene/{scene_id}.png")
+async def scene_preview(request:Request,jid:str,scene_id:str):
+    try:_require(request,"trainer")
+    except PermissionError:
+        if AUTH_REQUIRED:return JSONResponse({"error":"Authentication required"},status_code=401)
+    plan=STORE.get_plan(jid)
+    if not plan:return JSONResponse({"error":"Tutorial not found"},status_code=404)
+    scene=next((s for s in plan.get("steps",[]) if s.get("scene_id")==scene_id),None)
+    if not scene:return JSONResponse({"error":"Scene not found"},status_code=404)
+    raw=Path(str(scene.get("screenshot") or ""))
+    try:raw=raw.resolve();job_root=_job_dir(jid).resolve();raw.relative_to(job_root)
+    except Exception:return JSONResponse({"error":"Scene preview unavailable"},status_code=404)
+    if not raw.exists():return JSONResponse({"error":"Scene preview unavailable"},status_code=404)
+    return FileResponse(raw)
 
-    data = load_portal_data()
-
-    data.setdefault(
-        "prerequisites",
-        {}
-    )[video_id] = cleaned
-
-    save_portal_data(data)
-
-    return {
-        "success": True,
-        "video_id": video_id,
-        "prerequisites": cleaned,
-    }
-
-
-# ============================================================
-# HEALTH
-# ============================================================
-
-@app.get(
-    "/health"
-)
-async def health():
-
-    return {
-        "status": "ok",
-        "service": "Teamcenter AI Studio v2",
-    }
-
-
-# ============================================================
-# VIDEO GENERATION
-# ============================================================
-
-@app.post(
-    "/generate"
-)
-async def generate(
-    file: UploadFile = File(...)
-):
-
-    name = file.filename or ""
-
-    if not name.lower().endswith(
-        ".pdf"
-    ):
-
-        return JSONResponse(
-            {
-                "error": "Please upload a PDF."
-            },
-            status_code=400,
-        )
-
-    jid = uuid4().hex[:10]
-
-    job = JOBS / jid
-
-    job.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    pdf = job / "source.pdf"
-
-    pdf.write_bytes(
-        await file.read()
-    )
-
-    jobs[jid] = {
-        "status": "queued",
-        "progress": 2,
-        "message": "PDF uploaded",
-    }
-
-    asyncio.get_running_loop().run_in_executor(
-        pool,
-        run_job,
-        jid,
-        pdf,
-    )
-
-    return {
-        "job_id": jid,
-    }
-
-
-# ============================================================
-# GENERATION STATUS
-# ============================================================
-
-@app.get(
-    "/status/{jid}"
-)
-async def status(
-    jid: str
-):
-
-    if jid not in jobs:
-
-        return JSONResponse(
-            {
-                "error": "Job not found"
-            },
-            status_code=404,
-        )
-
-    return jobs[jid]
+@app.get("/media/{audience}/{jid}/{filename}")
+async def media(request:Request,audience:str,jid:str,filename:str):
+    safe={"tutorial.mp4","tutorial.vtt"}
+    if filename not in safe:return JSONResponse({"error":"Media not available"},status_code=404)
+    row=STORE.get_job(jid)
+    if not row:return JSONResponse({"error":"Tutorial not found"},status_code=404)
+    if audience=="trainee":
+        try:_require(request,"trainee")
+        except PermissionError:
+            if AUTH_REQUIRED:return JSONResponse({"error":"Authentication required"},status_code=401)
+        if row.get("publication_status")!="published":return JSONResponse({"error":"Tutorial is not published"},status_code=404)
+    elif audience=="trainer":
+        try:_require(request,"trainer")
+        except PermissionError:
+            if AUTH_REQUIRED:return JSONResponse({"error":"Authentication required"},status_code=401)
+    else:return JSONResponse({"error":"Invalid audience"},status_code=404)
+    path=_job_dir(jid)/filename
+    if not path.exists():return JSONResponse({"error":"Media not found"},status_code=404)
+    return FileResponse(path)
 
 
-# ============================================================
-# EXISTING VIDEO GENERATION PIPELINE
-# ============================================================
-
-def run_job(
-    jid,
-    pdf
-):
-
+def run_job(jid:str,pdf:Path):
+    job=pdf.parent
     try:
-
-        job = Path(pdf).parent
-
-        jobs[jid].update(
-            status="processing",
-            progress=8,
-            message=(
-                "Reading the document and extracting "
-                "embedded screenshots"
-            ),
-        )
-
-        print(
-            f"[JOB] {jid} PDF={pdf}"
-        )
-
-        print(
-            f"[JOB] {jid} JOB_DIR={job}"
-        )
-
-        # -----------------------------------------------------
-        # 1. PDF PROCESSING
-        # -----------------------------------------------------
-
-        data = process_pdf(
-            pdf,
-            job,
-        )
-
-        pages = data.get(
-            "pages",
-            []
-        )
-
-        screenshots = data.get(
-            "screenshots",
-            []
-        )
-
-        jobs[jid].update(
-            progress=28,
-            message=(
-                f"Extracted {len(pages)} pages and "
-                f"{len(screenshots)} embedded visual regions"
-            ),
-        )
-
-        # -----------------------------------------------------
-        # 2. AI PLAN
-        # -----------------------------------------------------
-
-        def plan_progress(
-            progress,
-            message="Building tutorial plan",
-        ):
-
-            """
-            Planning progress is expected to be 0-100.
-
-            build_tutorial_plan may report:
-
-                callback(progress)
-
-            or:
-
-                callback(progress, message)
-            """
-
-            try:
-
-                p = int(
-                    progress
-                )
-
-            except Exception:
-
-                p = 0
-
-            p = max(
-                0,
-                min(
-                    100,
-                    p
-                )
-            )
-
-            mapped = (
-                28
-                + int(
-                    22
-                    * (
-                        p
-                        / 100.0
-                    )
-                )
-            )
-
-            jobs[jid].update(
-                progress=mapped,
-                message=str(
-                    message
-                    or "Building tutorial plan"
-                ),
-            )
-
-        plan = build_tutorial_plan(
-            data,
-            narration_language="en-us",
-            progress_callback=plan_progress,
-        )
-
-        (
-            job / "plan.json"
-        ).write_text(
-            json.dumps(
-                plan,
-                indent=2,
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
-
-        jobs[jid].update(
-            progress=50,
-            message="Generating narration",
-        )
-
-        # -----------------------------------------------------
-        # 3. TTS
-        # -----------------------------------------------------
-
-        def tts_progress(
-            current,
-            total,
-            message="Generating narration",
-        ):
-
-            try:
-
-                current = int(
-                    current
-                )
-
-                total = int(
-                    total
-                )
-
-            except Exception:
-
-                current = 0
-                total = 0
-
-            if total > 0:
-
-                fraction = min(
-                    1.0,
-                    max(
-                        0.0,
-                        current
-                        / float(total),
-                    ),
-                )
-
-                progress = (
-                    50
-                    + int(
-                        20
-                        * fraction
-                    )
-                )
-
-            else:
-
-                progress = 50
-
-            jobs[jid].update(
-                progress=min(
-                    70,
-                    progress
-                ),
-                message=str(
-                    message
-                    or "Generating narration"
-                ),
-            )
-
-        audio = generate_narration(
-            plan,
-            job,
-            progress_callback=tts_progress,
-            language="en-us",
-            voice="af_heart",
-        )
-
-        (
-            job / "audio.json"
-        ).write_text(
-            json.dumps(
-                audio,
-                indent=2,
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
-
-        jobs[jid].update(
-            progress=75,
-            message=(
-                "Rendering screenshots, cursor guidance, "
-                "captions and narration"
-            ),
-        )
-
-        # -----------------------------------------------------
-        # 4. VIDEO RENDERING
-        # -----------------------------------------------------
-
-        final = (
-            job / "tutorial.mp4"
-        )
-
-        render(
-            plan,
-            audio,
-            job,
-            final,
-        )
-
-        # -----------------------------------------------------
-        # VALIDATE VIDEO
-        # -----------------------------------------------------
-
-        if (
-            not final.exists()
-            or final.stat().st_size < 10000
-        ):
-
-            raise RuntimeError(
-                "Generated video is missing or invalid."
-            )
-
-        # -----------------------------------------------------
-        # COMPLETED
-        # -----------------------------------------------------
-
-        jobs[jid].update(
-            status="completed",
-            progress=100,
-            message="Tutorial ready",
-            video_url=(
-                f"/media/{jid}/tutorial.mp4"
-            ),
-            video_path=str(
-                final
-            ),
-            title=plan.get(
-                "title",
-                "AI Learning Tutorial",
-            ),
-        )
-
-        print(
-            f"[VIDEO] {jid} generated successfully: "
-            f"{final} "
-            f"({final.stat().st_size / (1024 * 1024):.2f} MB)"
-        )
-
+        _update(jid,status="processing",progress=8,message="Reading document structure and visual evidence")
+        data=process_pdf(str(pdf),job);data["job_dir"]=str(job);data["filename"]=pdf.name
+        _update(jid,progress=25,message=f"Indexed {data.get('page_count',0)} pages and {data.get('screenshot_count',0)} visual assets")
+        plan=build_tutorial_plan(data,narration_language=os.getenv("NARRATION_LANGUAGE","en-us"),progress_callback=lambda p,m="":_update(jid,progress=28+int(p*0.22),message=m))
+        pre=validate_plan(plan);plan["qa"]={"pre_render":pre};plan["requires_trainer_review"]=not pre.get("publishable",False)
+        blocking=[x for x in pre.get("errors",[]) if x.get("code") not in {"REQUIRED_TARGET_MISSING"}]
+        if blocking:raise RuntimeError("Plan QA failed: "+"; ".join(x["message"] for x in blocking[:4]))
+        STORE.set_plan(jid,plan)
+        _update(jid,progress=52,message="Generating narration audio")
+        audio=generate_narration(plan,job,progress_callback=lambda p,m="":_update(jid,progress=52+int((p/max(1,len(plan.get('steps',[]))))*20),message=m),language=os.getenv("NARRATION_LANGUAGE","en-us"),voice=os.getenv("TTS_VOICE","af_heart"))
+        (job/"audio.json").write_text(json.dumps(audio,indent=2,ensure_ascii=False),encoding="utf-8")
+        _update(jid,progress=75,message="Rendering synchronized tutorial, captions and cursor timeline")
+        rendered=render_all_sections(plan,audio,str(job));post=validate_rendered_artifacts(str(job),rendered);plan["qa"]["post_render"]=post;plan["qa"]["publishable"]=bool(pre.get("publishable")) and bool(post.get("publishable")) and not any(s.get("target_review_required") for s in plan.get("steps",[]));plan["requires_trainer_review"]=not plan["qa"]["publishable"];STORE.set_plan(jid,plan)
+        _update(jid,status="completed",progress=100,message="Tutorial ready for trainer review",error=None)
     except Exception as exc:
-
-        traceback.print_exc()
-
-        jobs[jid].update(
-            status="error",
-            progress=0,
-            message=str(
-                exc
-            ),
-            error=str(
-                exc
-            ),
-        )
+        traceback.print_exc();_update(jid,status="error",progress=0,message=str(exc),error=str(exc))

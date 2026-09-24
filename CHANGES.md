@@ -1,58 +1,22 @@
-# Changes
+# Definitive build changes
 
-## Kokoro + UI language switching
-
-- Added Kokoro-82M as an explicit local `TTS_PROVIDER=kokoro` backend.
-- Added PCM-16 WAV output and duration validation.
-- Added per-language lazy Kokoro pipeline caching.
-- Added web UI dropdowns for narration language and matching Kokoro voice.
-- Supported UI language choices: Hinglish, Hindi, English US/UK, Spanish, French, Italian, Japanese, Brazilian Portuguese, and Mandarin Chinese.
-- Passed the selected narration language into the local Ollama narration prompt so the generated narration and TTS text match the selected language.
-- Azure remains the production backend and `auto` never silently selects Kokoro.
-- Added Kokoro setup, espeak-ng, language/voice, licensing, and production/demo guidance to README and `.env.example`.
-
-# Changes
-
-## Current implementation
-
-### Document generalization
-- Removed document-specific procedure steps and cursor coordinates.
-- Procedure extraction now uses page-aware numbered-list parsing first, then local Ollama text extraction, then local Ollama vision for image-only/scanned PDFs.
-- Step objects retain `source_page` provenance.
-- Embedded PDF screenshots retain page and bounding-box metadata.
-- PDF pages are rendered to images and retained as a visual fallback/source for scanned PDFs.
-
-### Visual grounding
-- Existing local Ollama vision model remains the visual backend (`qwen2.5vl:7b` by default).
-- Vision results are accepted only for known step numbers, valid normalized coordinates, matching source pages, and confidence at or above `OLLAMA_VISION_MIN_CONFIDENCE`.
-- Low-confidence or malformed vision results produce no cursor instead of inventing a coordinate.
-- If vision cannot ground a step, screenshot fallback stays on the step's source page; no cross-page assignment is made.
-
-### Narration
-- Existing local Ollama text model remains the narration backend (`llama3.2` by default).
-- Narration is requested as natural Hinglish in Roman script plus a Devanagari TTS version while preserving English UI/technical labels.
-- No document-specific narration fallback remains.
-
-### TTS
-- Azure Speech REST TTS is available through `TTS_PROVIDER=azure`.
-- Windows SAPI remains available through `TTS_PROVIDER=sapi` for compatibility.
-- Azure TTS failures are fatal when Azure is selected so a broken audio track cannot silently produce a misleading tutorial.
-
-### Reliability
-- Ollama text calls have configurable retry support (`OLLAMA_RETRIES`).
-- Core plan parsing, page-aware fallback mapping, and coordinate validation have unit tests.
-
-## Deliberately unchanged
-- Local Ollama text and vision model calls were not replaced with cloud LLMs.
-- `video_service.py` remains the existing renderer because it already consumes the generalized plan format.
-- Production/QOL work such as richer transitions, zooming, highlighting, authentication, persistence, and advanced job management is out of scope for this pass.
-
-
-## Local Hinglish TTS backend
-
-- Added optional `TTS_PROVIDER=local_hinglish` using an isolated `hinglish-tts` subprocess.
-- Added `HINGLISH_TTS_REPO`, `HINGLISH_REF_AUDIO`, `HINGLISH_REF_TEXT`, `HINGLISH_PYTHON`, and timeout configuration.
-- Local IndicF5 failures are fatal when explicitly selected, matching Azure's no-silent-degradation behavior.
-- Added `python-dotenv` and project-local `.env` loading before service imports so the documented environment-file workflow works.
-- Added explicit demo-only/licensing guidance for the IndicF5/hinglish-tts backend.
-- Kept the existing narration and video pipeline unchanged upstream/downstream.
+- Replaced screenshot-as-scene behavior with a canonical document/evidence/action/scene pipeline.
+- Preserved source numbering independently of rendered scene numbering.
+- Added metadata/ToC/index and repeated-document-furniture filtering.
+- Added OCR fallback for scanned/image-only pages.
+- Added nearby screenshot context and semantic page fallback.
+- Added compound imperative splitting, including `and` before another action verb.
+- Added provider-neutral text/vision model adapters with configuration-only model switching within Ollama.
+- Added model telemetry in per-job `ai_usage.jsonl`.
+- Added OCR-first target grounding, highlight hints, candidate scoring, vision escalation, ambiguity rejection, and second-pass visual verification.
+- Added trainer-set target points and two-point drag review.
+- Added canonical timing shared by video, audio, VTT and portal.
+- Added continuous single-tutorial rendering.
+- Added drag start/end cursor animation.
+- Added persistent SQLite job/publication/review state.
+- Removed unrestricted `/media` static exposure of source PDFs/intermediate artifacts.
+- Added optional authentication/role separation.
+- Added machine QA and a publish gate requiring verified visual targets.
+- Added rendered-timeline/plan scene-ID and duration validation.
+- Added frontend contract tests and end-to-end orchestration tests.
+- Added reusable documentation for model swapping, deployment and production acceptance.
