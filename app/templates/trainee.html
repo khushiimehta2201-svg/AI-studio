@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>Teamcenter AI Studio - Trainee Portal</title>
+
+    <link rel="stylesheet" href="/static/portal.css">
+</head>
+
+<body>
+
+<!-- ============================================================
+     TOP NAVIGATION
+============================================================ -->
+
+<header class="top-nav">
+
+    <div class="brand">
+
+        <div class="brand-mark">
+            TC
+        </div>
+
+        <div class="brand-text">
+
+            <div class="brand-title">
+                Teamcenter AI Studio
+            </div>
+
+            <div class="brand-subtitle">
+                Trainee Portal
+            </div>
+
+        </div>
+
+    </div>
+
+
+    <nav class="nav-links">
+
+        <a href="/" class="nav-link">
+            Generator
+        </a>
+
+        <a href="/trainee" class="nav-link active">
+            Trainee Portal
+        </a>
+
+        <a href="/trainer" class="nav-link">
+            Trainer Portal
+        </a>
+
+    </nav>
+
+</header>
+
+
+<!-- ============================================================
+     MAIN CONTENT
+============================================================ -->
+
+<main class="trainee-page">
+
+    <header class="trainee-page-header">
+        <div>
+            <div class="trainee-eyebrow">TRAINEE PORTAL</div>
+
+            <h1>Training videos</h1>
+
+            <p>
+                Videos your trainer has published. Locked ones require
+                watching their prerequisites first.
+            </p>
+        </div>
+
+        <span class="local-badge">LOCAL • PRIVATE</span>
+    </header>
+
+    <section class="trainee-library" aria-labelledby="libraryTitle">
+        <div class="trainee-library-toolbar">
+            <div>
+                <div class="trainee-eyebrow">TRAINING LIBRARY</div>
+                <h2 id="libraryTitle">Available tutorials</h2>
+                <span class="library-count">
+                    <strong id="videoCount">0</strong> published videos
+                </span>
+            </div>
+
+            <label class="portal-search">
+                <span class="search-icon" aria-hidden="true">🔍</span>
+                <input
+                    id="searchInput"
+                    type="search"
+                    placeholder="Search tutorials..."
+                    autocomplete="off"
+                >
+            </label>
+        </div>
+
+        <div id="videoGrid" class="trainee-video-grid">
+            <div class="portal-loading">Loading tutorials...</div>
+        </div>
+    </section>
+</main>
+
+
+<!-- ============================================================
+     JAVASCRIPT
+============================================================ -->
+
+<script src="/static/portal.js"></script>
+
+<script>
+
+document.addEventListener("DOMContentLoaded", function () {
+
+    if (typeof loadTraineeVideos === "function") {
+        loadTraineeVideos();
+    }
+
+});
+
+
+/*
+ * Tutorial search
+ */
+
+const searchInput =
+    document.getElementById("searchInput");
+
+
+if (searchInput) {
+
+    searchInput.addEventListener(
+        "input",
+        function () {
+
+            const query =
+                this.value
+                    .trim()
+                    .toLowerCase();
+
+            const cards =
+                document.querySelectorAll(
+                    "#videoGrid .video-card"
+                );
+
+
+            cards.forEach(function (card) {
+
+                const text =
+                    card.textContent
+                        .toLowerCase();
+
+
+                if (
+                    !query ||
+                    text.includes(query)
+                ) {
+
+                    card.style.display = "";
+
+                } else {
+
+                    card.style.display = "none";
+
+                }
+
+            });
+
+        }
+    );
+
+}
+
+</script>
+
+</body>
+</html>

@@ -1,0 +1,967 @@
+<!doctype html>
+
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+
+
+<meta
+    name="viewport"
+    content="width=device-width, initial-scale=1"
+>
+
+<title>Trainer Portal | Teamcenter AI Studio</title>
+
+<link
+    rel="stylesheet"
+    href="/static/portal.css"
+>
+
+
+</head>
+
+<body>
+
+<div class="portal-shell">
+
+
+<!-- ======================================================
+     TOP NAVIGATION
+     ====================================================== -->
+
+<header class="portal-topbar">
+
+    <div class="portal-brand">
+        <div class="brand-mark">TC</div>
+
+        <div>
+            <div class="brand-title">
+                Teamcenter AI Studio
+            </div>
+
+            <div class="brand-subtitle">
+                Trainer Portal
+            </div>
+        </div>
+    </div>
+
+    <nav class="portal-nav">
+
+        <a href="/">
+            Generator
+        </a>
+
+        <a href="/trainee">
+            Trainee Portal
+        </a>
+
+        <a
+            href="/trainer"
+            class="active"
+        >
+            Trainer Portal
+        </a>
+
+    </nav>
+
+</header>
+
+
+<!-- ======================================================
+     MAIN CONTENT
+     ====================================================== -->
+
+<main class="trainer-container">
+
+    <section class="trainer-header">
+
+        <div>
+
+            <div class="eyebrow">
+                TRAINER MANAGEMENT
+            </div>
+
+            <h1>
+                Training Library
+            </h1>
+
+            <p>
+                Manage generated tutorials, publish videos
+                for trainees, and add prerequisite resources.
+            </p>
+
+        </div>
+
+        <button
+            type="button"
+            class="secondary-button"
+            onclick="loadTrainerVideos()"
+        >
+            Refresh
+        </button>
+
+    </section>
+
+
+    <!-- ==================================================
+         STATUS
+         ================================================== -->
+
+    <div
+        id="trainerStatus"
+        class="trainer-status"
+        style="display:none;"
+    ></div>
+
+
+    <!-- ==================================================
+         VIDEO LIST
+         ================================================== -->
+
+    <section>
+
+        <div
+            id="trainerVideos"
+            class="trainer-video-list"
+        >
+
+            <div class="loading-state">
+                Loading generated tutorials...
+            </div>
+
+        </div>
+
+    </section>
+
+</main>
+```
+
+</div>
+
+<!-- ==========================================================
+     PREREQUISITE MODAL
+     ========================================================== -->
+
+<div
+    id="prerequisiteModal"
+    class="modal-overlay"
+    style="display:none;"
+>
+
+```
+<div class="modal-card">
+
+    <div class="modal-header">
+
+        <div>
+
+            <div class="eyebrow">
+                TRAINER SETTINGS
+            </div>
+
+            <h2>
+                Prerequisite Videos
+            </h2>
+
+        </div>
+
+        <button
+            type="button"
+            class="modal-close"
+            onclick="closePrerequisiteModal()"
+        >
+            ×
+        </button>
+
+    </div>
+
+
+    <p class="modal-description">
+
+        Add the video URLs that trainees should watch
+        before starting this tutorial.
+
+    </p>
+
+
+    <div id="prerequisiteInputs">
+
+        <!-- Inputs are added dynamically -->
+
+    </div>
+
+
+    <button
+        type="button"
+        class="add-link-button"
+        onclick="addPrerequisiteInput()"
+    >
+        + Add another prerequisite
+    </button>
+
+
+    <div class="modal-actions">
+
+        <button
+            type="button"
+            class="secondary-button"
+            onclick="closePrerequisiteModal()"
+        >
+            Cancel
+        </button>
+
+        <button
+            type="button"
+            class="primary-button"
+            onclick="savePrerequisites()"
+        >
+            Save Prerequisites
+        </button>
+
+    </div>
+
+</div>
+```
+
+</div>
+
+<script>
+
+let trainerVideos = [];
+let selectedVideoId = null;
+
+
+/* ============================================================
+   LOAD TRAINER VIDEOS
+   ============================================================ */
+
+async function loadTrainerVideos() {
+
+    const container =
+        document.getElementById(
+            "trainerVideos"
+        );
+
+    container.innerHTML = `
+        <div class="loading-state">
+            Loading generated tutorials...
+        </div>
+    `;
+
+    try {
+
+        const response =
+            await fetch(
+                "/api/trainer/videos"
+            );
+
+        if (!response.ok) {
+
+            throw new Error(
+                "Unable to load trainer videos."
+            );
+
+        }
+
+        const data =
+            await response.json();
+
+        trainerVideos =
+            Array.isArray(data.videos)
+                ? data.videos
+                : [];
+
+        renderTrainerVideos();
+
+    } catch (error) {
+
+        console.error(error);
+
+        container.innerHTML = `
+            <div class="empty-state">
+                <h3>
+                    Unable to load tutorials
+                </h3>
+
+                <p>
+                    ${escapeHtml(error.message)}
+                </p>
+
+                <button
+                    class="primary-button"
+                    onclick="loadTrainerVideos()"
+                >
+                    Try Again
+                </button>
+            </div>
+        `;
+    }
+}
+
+
+/* ============================================================
+   RENDER TRAINER VIDEOS
+   ============================================================ */
+
+function renderTrainerVideos() {
+
+    const container =
+        document.getElementById(
+            "trainerVideos"
+        );
+
+    if (!trainerVideos.length) {
+
+        container.innerHTML = `
+            <div class="empty-state">
+
+                <div class="empty-icon">
+                    🎬
+                </div>
+
+                <h3>
+                    No generated tutorials yet
+                </h3>
+
+                <p>
+                    Generate a tutorial from the
+                    main Generator page first.
+                </p>
+
+                <a
+                    href="/"
+                    class="primary-button"
+                >
+                    Go to Generator
+                </a>
+
+            </div>
+        `;
+
+        return;
+    }
+
+
+    container.innerHTML =
+        trainerVideos
+            .map(
+                video =>
+                    createTrainerVideoCard(
+                        video
+                    )
+            )
+            .join("");
+}
+
+
+/* ============================================================
+   TRAINER VIDEO CARD
+   ============================================================ */
+
+function createTrainerVideoCard(video) {
+
+    const published =
+        Boolean(
+            video.published
+        );
+
+    const prerequisites =
+        Array.isArray(
+            video.prerequisites
+        )
+            ? video.prerequisites
+            : [];
+
+    const statusText =
+        published
+            ? "Published"
+            : "Not Published";
+
+    const statusClass =
+        published
+            ? "published"
+            : "unpublished";
+
+
+    return `
+        <article class="trainer-video-card">
+
+            <div class="trainer-video-info">
+
+                <div class="trainer-video-status-row">
+
+                    <span
+                        class="publication-status ${statusClass}"
+                    >
+                        ${published ? "● Published" : "○ Not Published"}
+                    </span>
+
+                    <span class="video-id">
+                        ID: ${escapeHtml(video.id)}
+                    </span>
+
+                </div>
+
+
+                <h2>
+                    ${escapeHtml(
+                        video.title ||
+                        "Teamcenter Tutorial"
+                    )}
+                </h2>
+
+
+                <p>
+                    ${escapeHtml(
+                        video.description ||
+                        "Interactive Teamcenter training tutorial."
+                    )}
+                </p>
+
+
+                <div class="prerequisite-summary">
+
+                    <strong>
+                        Prerequisites:
+                    </strong>
+
+                    ${
+                        prerequisites.length
+                            ? `${prerequisites.length} link${prerequisites.length === 1 ? "" : "s"} added`
+                            : "None added"
+                    }
+
+                </div>
+
+            </div>
+
+
+            <div class="trainer-video-actions">
+
+                <a
+                    href="${escapeAttribute(
+                        video.video_url || "#"
+                    )}"
+                    target="_blank"
+                    rel="noopener"
+                    class="secondary-button"
+                >
+                    Preview
+                </a>
+
+
+                <button
+                    type="button"
+                    class="secondary-button"
+                    onclick="openPrerequisiteModal('${escapeJs(video.id)}')"
+                >
+                    Prerequisites
+                </button>
+
+
+                <button
+                    type="button"
+                    class="${
+                        published
+                            ? "unpublish-button"
+                            : "publish-button"
+                    }"
+                    onclick="togglePublish('${escapeJs(video.id)}')"
+                >
+                    ${
+                        published
+                            ? "Unpublish"
+                            : "Publish Video"
+                    }
+                </button>
+
+            </div>
+
+        </article>
+    `;
+}
+
+
+/* ============================================================
+   PUBLISH / UNPUBLISH
+   ============================================================ */
+
+async function togglePublish(videoId) {
+
+    const video =
+        trainerVideos.find(
+            item =>
+                item.id === videoId
+        );
+
+    if (!video) {
+        return;
+    }
+
+
+    const action =
+        video.published
+            ? "unpublish"
+            : "publish";
+
+
+    const confirmed =
+        window.confirm(
+            video.published
+                ? "Do you want to unpublish this tutorial from the trainee portal?"
+                : "Do you want to publish this tutorial to the trainee portal?"
+        );
+
+
+    if (!confirmed) {
+        return;
+    }
+
+
+    try {
+
+        showTrainerStatus(
+            action === "publish"
+                ? "Publishing tutorial..."
+                : "Unpublishing tutorial...",
+            "info"
+        );
+
+
+        const response =
+            await fetch(
+                `/api/trainer/publish/${encodeURIComponent(videoId)}`,
+                {
+                    method: "POST"
+                }
+            );
+
+
+        const data =
+            await response.json();
+
+
+        if (!response.ok) {
+
+            throw new Error(
+                data.error ||
+                "Unable to update publication status."
+            );
+
+        }
+
+
+        video.published =
+            Boolean(
+                data.published
+            );
+
+
+        renderTrainerVideos();
+
+
+        showTrainerStatus(
+            video.published
+                ? "Tutorial published successfully."
+                : "Tutorial unpublished successfully.",
+            "success"
+        );
+
+    } catch (error) {
+
+        console.error(error);
+
+        showTrainerStatus(
+            error.message ||
+            "Unable to update publication status.",
+            "error"
+        );
+    }
+}
+
+
+/* ============================================================
+   PREREQUISITE MODAL
+   ============================================================ */
+
+function openPrerequisiteModal(videoId) {
+
+    selectedVideoId =
+        videoId;
+
+    const video =
+        trainerVideos.find(
+            item =>
+                item.id === videoId
+        );
+
+
+    const modal =
+        document.getElementById(
+            "prerequisiteModal"
+        );
+
+    const inputs =
+        document.getElementById(
+            "prerequisiteInputs"
+        );
+
+
+    inputs.innerHTML = "";
+
+
+    const existing =
+        video &&
+        Array.isArray(
+            video.prerequisites
+        )
+            ? video.prerequisites
+            : [];
+
+
+    if (existing.length) {
+
+        existing.forEach(
+            url =>
+                addPrerequisiteInput(
+                    url
+                )
+        );
+
+    } else {
+
+        addPrerequisiteInput();
+
+    }
+
+
+    modal.style.display =
+        "flex";
+}
+
+
+function closePrerequisiteModal() {
+
+    const modal =
+        document.getElementById(
+            "prerequisiteModal"
+        );
+
+    modal.style.display =
+        "none";
+
+    selectedVideoId =
+        null;
+}
+
+
+/* ============================================================
+   ADD PREREQUISITE INPUT
+   ============================================================ */
+
+function addPrerequisiteInput(
+    value = ""
+) {
+
+    const container =
+        document.getElementById(
+            "prerequisiteInputs"
+        );
+
+
+    const row =
+        document.createElement(
+            "div"
+        );
+
+    row.className =
+        "prerequisite-input-row";
+
+
+    row.innerHTML = `
+
+        <input
+            type="url"
+            class="prerequisite-url"
+            placeholder="https://example.com/training-video"
+            value="${escapeAttribute(value)}"
+        >
+
+        <button
+            type="button"
+            class="remove-link-button"
+            onclick="this.parentElement.remove()"
+            title="Remove"
+        >
+            ×
+        </button>
+
+    `;
+
+
+    container.appendChild(
+        row
+    );
+}
+
+
+/* ============================================================
+   SAVE PREREQUISITES
+   ============================================================ */
+
+async function savePrerequisites() {
+
+    if (!selectedVideoId) {
+        return;
+    }
+
+
+    const fields =
+        document.querySelectorAll(
+            ".prerequisite-url"
+        );
+
+
+    const urls = [];
+
+
+    fields.forEach(
+        field => {
+
+            const value =
+                field.value.trim();
+
+            if (value) {
+
+                urls.push(
+                    value
+                );
+
+            }
+
+        }
+    );
+
+
+    try {
+
+        const response =
+            await fetch(
+                `/api/trainer/prerequisites/${encodeURIComponent(selectedVideoId)}`,
+                {
+                    method: "POST",
+
+                    headers: {
+                        "Content-Type":
+                            "application/json"
+                    },
+
+                    body:
+                        JSON.stringify({
+                            prerequisites:
+                                urls
+                        })
+                }
+            );
+
+
+        const data =
+            await response.json();
+
+
+        if (!response.ok) {
+
+            throw new Error(
+                data.error ||
+                "Unable to save prerequisites."
+            );
+
+        }
+
+
+        const video =
+            trainerVideos.find(
+                item =>
+                    item.id ===
+                    selectedVideoId
+            );
+
+
+        if (video) {
+
+            video.prerequisites =
+                data.prerequisites || [];
+
+        }
+
+
+        closePrerequisiteModal();
+
+        renderTrainerVideos();
+
+
+        showTrainerStatus(
+            "Prerequisite links saved successfully.",
+            "success"
+        );
+
+    } catch (error) {
+
+        console.error(error);
+
+        showTrainerStatus(
+            error.message ||
+            "Unable to save prerequisite links.",
+            "error"
+        );
+    }
+}
+
+
+/* ============================================================
+   STATUS MESSAGE
+   ============================================================ */
+
+function showTrainerStatus(
+    message,
+    type = "info"
+) {
+
+    const element =
+        document.getElementById(
+            "trainerStatus"
+        );
+
+
+    element.textContent =
+        message;
+
+
+    element.className =
+        `trainer-status ${type}`;
+
+
+    element.style.display =
+        "block";
+
+
+    window.clearTimeout(
+        window.trainerStatusTimer
+    );
+
+
+    window.trainerStatusTimer =
+        window.setTimeout(
+            () => {
+
+                element.style.display =
+                    "none";
+
+            },
+            4000
+        );
+}
+
+
+/* ============================================================
+   ESCAPE HELPERS
+   ============================================================ */
+
+function escapeHtml(value) {
+
+    return String(
+        value ?? ""
+    )
+        .replaceAll(
+            "&",
+            "&amp;"
+        )
+        .replaceAll(
+            "<",
+            "&lt;"
+        )
+        .replaceAll(
+            ">",
+            "&gt;"
+        )
+        .replaceAll(
+            '"',
+            "&quot;"
+        )
+        .replaceAll(
+            "'",
+            "&#039;"
+        );
+}
+
+
+function escapeAttribute(value) {
+
+    return escapeHtml(
+        value
+    );
+}
+
+
+function escapeJs(value) {
+
+    return String(
+        value ?? ""
+    )
+        .replaceAll(
+            "\\",
+            "\\\\"
+        )
+        .replaceAll(
+            "'",
+            "\\'"
+        )
+        .replaceAll(
+            '"',
+            '\\"'
+        );
+}
+
+
+/* ============================================================
+   MODAL BACKGROUND CLICK
+   ============================================================ */
+
+document
+    .getElementById(
+        "prerequisiteModal"
+    )
+    .addEventListener(
+        "click",
+        function(event) {
+
+            if (
+                event.target ===
+                this
+            ) {
+
+                closePrerequisiteModal();
+
+            }
+
+        }
+    );
+
+
+/* ============================================================
+   INITIAL LOAD
+   ============================================================ */
+
+document.addEventListener(
+    "DOMContentLoaded",
+    () => {
+
+        loadTrainerVideos();
+
+    }
+);
+
+</script>
+
+</body>
+</html>

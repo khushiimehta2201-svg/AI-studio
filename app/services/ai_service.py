@@ -181,7 +181,7 @@ def build_tutorial_plan(
     doc_title = steps[0]["title"] if steps else "Software Training Tutorial"
     plan = {
         "title": doc_title,
-        "description": "Enterprise tutorial generated per UI screenshot.",
+        "description": "Tutorial generated from UI screenshots.",
         "narration_language": narration_language,
         "steps": steps,
         "scene_count": len(steps),

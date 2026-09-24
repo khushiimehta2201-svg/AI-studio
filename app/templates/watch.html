@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1"
+    >
+
+    <title>Tutorial - Teamcenter AI Studio</title>
+
+    <link
+        rel="stylesheet"
+        href="/static/portal.css"
+    >
+</head>
+
+
+<body>
+
+    <!-- =========================================================
+         TOP NAVIGATION
+    ========================================================== -->
+
+    <header class="top-nav">
+
+        <a
+            class="watch-brand"
+            href="/trainee"
+        >
+            <span class="brand-mark">
+                TC
+            </span>
+
+            <span>
+                <strong>
+                    Teamcenter AI Studio
+                </strong>
+
+                <small>
+                    Trainee Portal
+                </small>
+            </span>
+        </a>
+
+
+        <nav
+            class="nav-links"
+            aria-label="Portal navigation"
+        >
+
+            <a
+                class="nav-link"
+                href="/"
+            >
+                Generator
+            </a>
+
+            <a
+                class="nav-link active"
+                href="/trainee"
+            >
+                Trainee Portal
+            </a>
+
+            <a
+                class="nav-link"
+                href="/trainer"
+            >
+                Trainer Portal
+            </a>
+
+        </nav>
+
+    </header>
+
+
+
+    <!-- =========================================================
+         MAIN WATCH PAGE
+    ========================================================== -->
+
+    <main class="watch-page">
+
+
+        <!-- =====================================================
+             TUTORIAL HEADER
+        ====================================================== -->
+
+        <header class="watch-header">
+
+            <div>
+
+                <div class="watch-eyebrow">
+                    TRAINEE PORTAL
+                </div>
+
+                <h1 id="tutorialTitle">
+                    Loading...
+                </h1>
+
+                <p id="tutorialDescription">
+                    Loading tutorial information...
+                </p>
+
+            </div>
+
+        </header>
+
+
+
+        <!-- =====================================================
+             BACK LINK
+        ====================================================== -->
+
+        <a
+            class="back-link"
+            href="/trainee"
+        >
+            &#8592; Back to all videos
+        </a>
+
+
+
+        <!-- =====================================================
+             MAIN VIDEO + RIGHT SIDEBAR
+        ====================================================== -->
+
+        <div class="watch-layout">
+
+
+            <!-- =================================================
+                 LEFT SIDE
+            ================================================== -->
+
+            <section class="video-column">
+
+
+                <!-- =============================================
+                     SINGLE TUTORIAL EXPLANATION
+                ============================================== -->
+
+                <div class="video-dialogue">
+                    <strong>Tutorial explanation</strong>
+                    <p id="topicIntro">Loading tutorial explanation...</p>
+                </div>
+
+                <div class="video-container">
+                    <video
+                        id="tutorialVideo"
+                        controls
+                        playsinline
+                        preload="metadata"
+                    ></video>
+                </div>
+            </section>
+
+            <aside class="tutorial-sidebar">
+                <section class="watch-card action-dialogue">
+                    <h2>Actions performed in this video</h2>
+                    <div id="currentAction" class="current-action">
+                        Loading current action...
+                    </div>
+                    <ol id="actionList" class="action-list">
+                        <li>Loading actions...</li>
+                    </ol>
+                </section>
+
+                <section class="watch-card prerequisite-card">
+                    <h2>Prerequisites</h2>
+                    <div id="prerequisiteList" class="prerequisite-list">
+                        <div class="empty-state">No prerequisites added.</div>
+                    </div>
+                </section>
+            </aside>
+
+        </div>
+
+    </main>
+
+
+
+    <!-- =========================================================
+         PORTAL JAVASCRIPT
+    ========================================================== -->
+
+    <script src="/static/portal.js"></script>
+
+
+    <script>
+
+        document.addEventListener(
+            "DOMContentLoaded",
+            loadTutorial
+        );
+
+    </script>
+
+
+</body>
+
+</html>
