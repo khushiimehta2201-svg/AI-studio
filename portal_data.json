@@ -1,10 +1,17 @@
 {
   "published": {
-    "ce8630eac2": false
+    "ce8630eac2": false,
+    "3ec6016e20": true
   },
   "prerequisites": {
     "5931708d99": [
       "http://127.0.0.1:8000/media/decee6eb4e/tutorial.mp4"
+    ],
+    "3ec6016e20": [
+      "http://127.0.0.1:8000/media/3ec6016e20/tutorial.mp4"
+    ],
+    "e51048a9b2": [
+      "http://127.0.0.1:8000/media/3ec6016e20/tutorial.mp4"
     ]
   }
 }

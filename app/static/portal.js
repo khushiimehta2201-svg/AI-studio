@@ -230,6 +230,14 @@ function renderTutorial(tutorial) {
         tutorial.description ||
         "";
 
+    const generatedDescription =
+        "Tutorial generated from UI screenshots.";
+
+    const visibleDescription =
+        description === generatedDescription
+            ? ""
+            : description;
+
     const videoUrl =
         tutorial.video_url ||
         tutorial.videoUrl ||
@@ -244,15 +252,19 @@ function renderTutorial(tutorial) {
 
     document.getElementById(
         "tutorialDescription"
-    ).textContent = description;
+    ).textContent = visibleDescription;
+
+    const topicIntro =
+        tutorial.topic_intro ||
+        tutorial.intro ||
+        "";
 
     document.getElementById(
         "topicIntro"
     ).textContent =
-        tutorial.topic_intro ||
-        tutorial.intro ||
-        description ||
-        "This tutorial provides a guided walkthrough.";
+        topicIntro === generatedDescription
+            ? ""
+            : topicIntro;
 
     const video =
         document.getElementById(
@@ -485,7 +497,7 @@ if (!prerequisites.length) {
 
     container.innerHTML = `
         <div class="empty-state">
-            There is no prerequisite video for this.
+            There is no prerequisite video for this. You're good to go.
         </div>
     `;
 
@@ -505,7 +517,7 @@ const validPrerequisites = prerequisites.filter(item => {
 if (!validPrerequisites.length) {
     container.innerHTML = `
         <div class="empty-state">
-            There is no prerequisite video for this.
+            There is no prerequisite video for this. You're good to go.
         </div>
     `;
     return;

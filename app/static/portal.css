@@ -2067,10 +2067,6 @@ padding:
 
 .video-dialogue {
     padding: 18px 32px;
-    background: #dfe7e5;
-    border: 1px solid #c9d6d3;
-    border-bottom: 0;
-    border-radius: 12px 12px 0 0;
 }
 
 .video-dialogue strong {
@@ -2080,7 +2076,7 @@ padding:
 
 .video-dialogue p {
     max-width: 720px;
-    margin: 68px 0 12px;
+    margin: 12px 0;
     color: #172033;
     font-size: 17px;
     font-weight: 700;
@@ -2280,9 +2276,9 @@ padding:
 
     gap: 8px;
 
-    max-height: 90px;
+    max-height: 140px;
 
-    overflow: hidden;
+    overflow-y: auto;
 }
 
 .watch-card .prerequisite-list a {
@@ -2302,9 +2298,17 @@ padding:
 }
 
 .watch-card .empty-state {
+    min-height: 0;
+
+    padding: 0;
+
     color: #637892;
 
     font-size: 13px;
+
+    background: transparent;
+
+    border: 0;
 }
 .watch-card .action-list li {
     margin: 0;
