@@ -128,7 +128,11 @@ def _draw_text_scene(title: str, body: str, kind: str = "explanation") -> np.nda
     cv2.putText(canvas,"Teamcenter AI Studio",(24,37),cv2.FONT_HERSHEY_SIMPLEX,0.72,(255,255,255),2,cv2.LINE_AA)
 
     if kind=="transition":
-        cv2.putText(canvas,"SECTION",(70,132),cv2.FONT_HERSHEY_SIMPLEX,0.70,TEAMCENTER_ACCENT,2,cv2.LINE_AA)
+        label="SECTION"
+        # Procedure transition cards introduce an executable procedure inside
+        # a section, so label them separately from section headers.
+        # The renderer remains cursor-free for both kinds.
+        cv2.putText(canvas,label,(70,132),cv2.FONT_HERSHEY_SIMPLEX,0.70,TEAMCENTER_ACCENT,2,cv2.LINE_AA)
         wrapped=_wrap_text(title or "Tutorial section",46)
         y=280
         for line in wrapped[:2]:
@@ -140,12 +144,16 @@ def _draw_text_scene(title: str, body: str, kind: str = "explanation") -> np.nda
         return canvas
 
     cv2.putText(canvas,"CONCEPT",(70,120),cv2.FONT_HERSHEY_SIMPLEX,0.62,TEAMCENTER_ACCENT,2,cv2.LINE_AA)
-    title_text=(title or "Concept")[:110]
-    cv2.putText(canvas,title_text,(70,175),cv2.FONT_HERSHEY_SIMPLEX,1.0,(40,45,48),2,cv2.LINE_AA)
-    cv2.rectangle(canvas,(62,215),(WIDTH-62,570),(232,235,231),-1)
-    cv2.rectangle(canvas,(62,215),(WIDTH-62,570),TEAMCENTER_ACCENT,2,cv2.LINE_AA)
-    y=270
-    for line in _wrap_text(body or "Continue with the tutorial.",88)[:9]:
+    title_lines=_wrap_text(title or "Concept",42)[:2]
+    title_y=165
+    for line in title_lines:
+        cv2.putText(canvas,line,(70,title_y),cv2.FONT_HERSHEY_SIMPLEX,0.88,(40,45,48),2,cv2.LINE_AA)
+        title_y+=42
+    box_top=title_y+18
+    cv2.rectangle(canvas,(62,box_top),(WIDTH-62,570),(232,235,231),-1)
+    cv2.rectangle(canvas,(62,box_top),(WIDTH-62,570),TEAMCENTER_ACCENT,2,cv2.LINE_AA)
+    y=box_top+55
+    for line in _wrap_text(body or "Continue with the tutorial.",88)[:8]:
         cv2.putText(canvas,line,(88,y),cv2.FONT_HERSHEY_SIMPLEX,0.67,(60,65,68),2,cv2.LINE_AA); y+=38
     return canvas
 

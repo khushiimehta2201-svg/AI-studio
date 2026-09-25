@@ -44,6 +44,7 @@ def token_similarity(query:str,candidate:str)->float:
 def action_type(action:str)->str:
     low=clean(action).lower()
     if low.startswith("press "):return "Press"
+    if re.match(r"^go\s+to\b", low):return "Navigate"
     if "double-click" in low:return "Double-click"
     if "right-click" in low:return "Right-click"
     for v,l in (("click","Click"),("select","Select"),("choose","Choose"),("enter","Enter"),("type","Type"),("open","Open"),("navigate","Navigate"),("visit","Visit"),("search","Search"),("save","Save"),("submit","Submit"),("create","Create"),("delete","Delete"),("expand","Expand"),("collapse","Collapse"),("drag","Drag"),("drop","Drop"),("fill","Fill"),("upload","Upload"),("download","Download")):
@@ -54,7 +55,7 @@ def action_type(action:str)->str:
 def interaction_for(action:str,has_target:bool)->str:
     if not has_target or action_type(action)=="Press":return "none"
     k=action_type(action)
-    if k in {"Click","Double-click","Right-click","Select","Choose","Open","Save","Submit","Create","Delete","Expand","Collapse"}:
+    if k in {"Click","Double-click","Right-click","Select","Choose","Open","Save","Submit","Create","Delete","Expand","Collapse","Navigate"}:
         return {"Double-click":"double_click","Right-click":"right_click"}.get(k,"click")
     if k in {"Enter","Type","Search","Fill"}:return "focus"
     if k in {"Drag","Drop"}:return "drag"
@@ -87,7 +88,7 @@ def target_queries(action:str)->List[str]:
         q=re.sub(r"\b(field|textbox|input)\b"," ",m.group(1),flags=re.I); q=clean(q)
         if q:out.append(q)
         return out[:3]
-    m=re.search(r"\b(?:open|navigate|visit|launch|switch\s+to)\s+(?:to\s+)?(?:the\s+)?(.+?)(?:\s+(?:and|in|on|at|within|inside|from|under)\b|[.,;]|$)",text,re.I)
+    m=re.search(r"\b(?:go\s+to|open|navigate|visit|launch|switch\s+to)\s+(?:to\s+)?(?:the\s+)?(.+?)(?:\s+(?:and|in|on|at|within|inside|from|under)\b|[.,;]|$)",text,re.I)
     if m:
         q=re.sub(r"\b(menu|tab|window|dialog)\b"," ",m.group(1),flags=re.I); q=clean(q)
         if q:out.append(q)
@@ -161,17 +162,75 @@ def _highlight_candidates(shot:Dict[str,Any])->List[Dict[str,Any]]:
     return [{"point":_point_from_box(b),"bounding_box":list(b),"target_name":"","confidence":0.60,"source":"highlight_only"} for b in (shot.get("annotation_boxes") or []) if isinstance(b,(list,tuple)) and len(b)>=4]
 
 
-def select_screenshots(action:str,page:Dict[str,Any],screenshots:Sequence[Dict[str,Any]])->Tuple[List[Dict[str,Any]],List[Dict[str,Any]]]:
-    queries=target_queries(action); page_no=int(page.get("page") or 1); action_bbox=page.get("action_bbox"); scored=[]
+def _layout_proximity(action_bbox: Any, shot: Dict[str, Any]) -> float:
+    if not action_bbox or not shot.get("page_rect"):
+        return 0.0
+    try:
+        ax0, ay0, ax1, ay1 = [float(v) for v in action_bbox[:4]]
+        sx0, sy0, sx1, sy1 = [float(v) for v in shot["page_rect"][:4]]
+    except Exception:
+        return 0.0
+    if sy0 >= ay1:
+        gap = sy0 - ay1
+    elif ay0 >= sy1:
+        gap = ay0 - sy1
+    else:
+        gap = 0.0
+    return max(0.0, 1.0 - min(1.0, gap / 180.0))
+
+
+def _flow_bonus(action_bbox: Any, shot: Dict[str, Any], same_page_shots: Sequence[Dict[str, Any]]) -> float:
+    """Prefer the next visual asset below an instruction line.
+
+    Training PDFs often put a numbered procedure list immediately before the
+    screenshot that demonstrates that list. Using document flow here is much
+    stronger than OCR alone when identical labels appear in multiple UI states.
+    """
+    if not action_bbox or not shot.get("page_rect"):return 0.0
+    try:
+        _, ay0, _, ay1 = [float(v) for v in action_bbox[:4]]
+        sy0, sy1 = float(shot["page_rect"][1]), float(shot["page_rect"][3])
+    except Exception:
+        return 0.0
+    if sy0 >= ay1:
+        below=[x for x in same_page_shots if x.get("page_rect") and float(x["page_rect"][1])>=ay1]
+        below.sort(key=lambda x: float(x["page_rect"][1]))
+        if below and below[0] is shot:
+            return 0.48
+    if ay0 >= sy1:
+        above=[x for x in same_page_shots if x.get("page_rect") and float(x["page_rect"][3])<=ay0]
+        above.sort(key=lambda x: float(x["page_rect"][3]),reverse=True)
+        if above and above[0] is shot:
+            return 0.16
+    return 0.0
+
+
+def _full_page_action_evidence_allowed(shot: Dict[str, Any], page: Dict[str, Any]) -> bool:
+    if not shot.get("is_full_page"):
+        return True
+    # A rendered PDF page is not UI evidence merely because its text contains
+    # UI vocabulary. Allow a full-page asset only when the page itself looks
+    # like an image/OCR-captured application screen and there is no source-text
+    # procedure structure competing with it.
+    return (
+        str(page.get("text_source") or "") == "ocr"
+        and page.get("visual_page_role") == "ui_page"
+        and not page.get("action_bbox")
+    )
+
+
+def select_screenshots(action: str, page: Dict[str, Any], screenshots: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    queries=target_queries(action)
+    page_no=int(page.get("page") or 1)
+    action_bbox=page.get("action_bbox")
+    scored=[]
     page_window=max(0,int(os.getenv("EVIDENCE_PAGE_WINDOW","2")))
+    same_page_shots=[x for x in screenshots if isinstance(x,dict) and int(x.get("page") or page_no)==page_no and not x.get("is_full_page") and str(x.get("visual_role") or "unknown") not in {"decorative","logo","metadata"}]
     for shot in screenshots:
         if not isinstance(shot,dict):continue
         role=str(shot.get("visual_role") or "unknown")
         if role in {"decorative","logo","metadata"}:continue
-        # A normal document page is evidence about the source material, not
-        # the application UI. Never let it become an action screenshot because
-        # OCR can find the same words in the PDF instructions themselves.
-        if shot.get("is_full_page") and page.get("visual_page_role") != "ui_page":
+        if shot.get("is_full_page") and not _full_page_action_evidence_allowed(shot,page):
             continue
         path=str(shot.get("path") or "")
         if not path or not os.path.exists(path):continue
@@ -180,23 +239,22 @@ def select_screenshots(action:str,page:Dict[str,Any],screenshots:Sequence[Dict[s
         score=0.44 if dist==0 else 0.10
         if role in {"screenshot_candidate","screenshot","ui_screenshot","full_page_ui"}:score+=0.22
         if shot.get("is_full_page"):score+=0.03
+        layout=_layout_proximity(action_bbox,shot)
+        flow=_flow_bonus(action_bbox,shot,same_page_shots)
+        score+=0.42*layout+flow
         ocr_score=0.0
         for q in queries:
+            if not q: continue
             cs=_ocr_candidates(q,path)
             if cs:ocr_score=max(ocr_score,cs[0]["confidence"])
-        score+=0.30*ocr_score
+        score+=0.22*ocr_score
         nearby=clean(str(shot.get("nearby_text") or ""))
         if nearby and queries:
-            nearby_sim=max(token_similarity(q,nearby) for q in queries)
+            nearby_sim=max(token_similarity(q,nearby) for q in queries if q)
             score+=0.10*nearby_sim
-        if action_bbox and shot.get("page_rect"):
-            try:
-                r=shot["page_rect"]; acx=(float(action_bbox[0])+float(action_bbox[2]))/2; acy=(float(action_bbox[1])+float(action_bbox[3]))/2; scx=(float(r[0])+float(r[2]))/2; scy=(float(r[1])+float(r[3]))/2
-                d=(abs(acx-scx)+abs(acy-scy))/max(1,float(page.get("width") or 1),float(page.get("height") or 1)); score+=max(0,0.08-d*0.03)
-            except Exception:pass
-        scored.append((score,shot,ocr_score))
+        scored.append((score,shot,ocr_score,layout+flow))
     scored.sort(key=lambda x:x[0],reverse=True)
-    return [x[1] for x in scored[:5]],[{"path":x[1].get("path"),"score":round(x[0],4),"ocr_score":round(x[2],4),"role":x[1].get("visual_role")} for x in scored[:5]]
+    return [x[1] for x in scored[:5]],[{"path":x[1].get("path"),"score":round(x[0],4),"ocr_score":round(x[2],4),"layout_score":round(x[3],4),"role":x[1].get("visual_role")} for x in scored[:5]]
 
 
 def _vision_candidates(client,action:str,queries:List[str],path:str)->List[Dict[str,Any]]:
@@ -228,9 +286,10 @@ Rules: coordinates are normalized 0..1; return at most 3 candidates; candidates 
         if not isinstance(c,dict):continue
         pt=_norm_point(c.get("click_point"),1,1); box=_norm_box(c.get("bounding_box"),1,1)
         if pt is None:continue
-        conf=float(c.get("confidence",0.0) or 0.0); name=clean(c.get("target_name")); sim=max([token_similarity(q,name) for q in queries] or [0])
+        conf=float(c.get("confidence",0.0) or 0.0); name=clean(c.get("target_name")); sim=max([token_similarity(q,name) for q in queries if q] or [0])
         accept_conf=float(os.getenv("VISION_ACCEPT_CONFIDENCE","0.86"))
-        if conf<accept_conf or (sim<0.25 and conf<0.95):continue
+        semantic_only = any(q == "mandatory field" for q in queries)
+        if conf<accept_conf or (not semantic_only and sim<0.25 and conf<0.95):continue
         if box and not(box[0]<=pt[0]<=box[2] and box[1]<=pt[1]<=box[3]):continue
         out.append({"point":pt,"bounding_box":box,"target_name":name,"confidence":conf,"source":"vision","evidence":clean(c.get("evidence")),"name_similarity":sim})
     result=sorted(out,key=lambda x:x["confidence"],reverse=True)[:3]
@@ -239,9 +298,13 @@ Rules: coordinates are normalized 0..1; return at most 3 candidates; candidates 
 
 
 def ground_action(action:str,page:Dict[str,Any],screenshots:Sequence[Dict[str,Any]],vision_client=None)->Dict[str,Any]:
-    queries=target_queries(action); kind=action_type(action); interaction=interaction_for(action,bool(queries))
-    if not queries:
+    queries=target_queries(action); kind=action_type(action)
+    generic_visual = bool(re.search(r"\b(?:fill|enter|type)\b", clean(action), re.I) and re.search(r"\b(?:mandatory|required)\b", clean(action), re.I))
+    if not queries and not generic_visual:
         return {"status":"not_applicable","point":None,"points":[],"bounding_box":None,"bounding_boxes":[],"target_name":"","query":"","confidence":1.0,"source":"action_semantics","review_required":False,"screenshot":None,"debug":{}}
+    if generic_visual:
+        queries=["mandatory field"]
+    interaction=interaction_for(action,True)
     candidates,debug_candidates=select_screenshots(action,page,screenshots)
     base={"status":"unresolved","point":None,"points":[],"bounding_box":None,"bounding_boxes":[],"target_name":"","query":queries[0],"confidence":0.0,"source":"none","review_required":True,"screenshot":candidates[0] if candidates else None,"debug":{"candidate_screenshots":debug_candidates,"queries":queries}}
     if not candidates:return base
