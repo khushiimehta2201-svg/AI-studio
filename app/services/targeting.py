@@ -168,6 +168,11 @@ def select_screenshots(action:str,page:Dict[str,Any],screenshots:Sequence[Dict[s
         if not isinstance(shot,dict):continue
         role=str(shot.get("visual_role") or "unknown")
         if role in {"decorative","logo","metadata"}:continue
+        # A normal document page is evidence about the source material, not
+        # the application UI. Never let it become an action screenshot because
+        # OCR can find the same words in the PDF instructions themselves.
+        if shot.get("is_full_page") and page.get("visual_page_role") != "ui_page":
+            continue
         path=str(shot.get("path") or "")
         if not path or not os.path.exists(path):continue
         sp=int(shot.get("page") or page_no); dist=abs(sp-page_no)

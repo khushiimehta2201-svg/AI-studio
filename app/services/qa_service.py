@@ -43,6 +43,10 @@ def validate_plan(plan:Dict[str,Any])->Dict[str,Any]:
                 warnings.append(issue("TARGET_UNRESOLVED","warning","Action requires a visual target but no verified target is available.",sid))
                 errors.append(issue("REQUIRED_TARGET_MISSING","error","A target-requiring action cannot be published without a verified cursor target.",sid))
             if s.get("cursor_enabled") and s.get("target_status")!="verified":errors.append(issue("CURSOR_WITHOUT_VERIFICATION","error","Cursor is enabled for an unverified target.",sid))
+            if s.get("cursor_enabled") and not s.get("screenshot"):
+                errors.append(issue("CURSOR_WITHOUT_EVIDENCE","error","Cursor is enabled without an action screenshot.",sid))
+            if s.get("cursor_enabled") and s.get("is_full_page") and s.get("visual_page_role")!="ui_page":
+                errors.append(issue("CURSOR_ON_DOCUMENT_PAGE","error","Cursor cannot be enabled on a normal document page.",sid))
             if s.get("target_status")=="verified" and s.get("interaction")!="none":
                 point=s.get("cursor")
                 valid_point=isinstance(point,(list,tuple)) and len(point)==2 and all(isinstance(v,(int,float)) and 0<=float(v)<=1 for v in point)

@@ -118,15 +118,35 @@ def _fit_image(
 
 
 def _draw_text_scene(title: str, body: str, kind: str = "explanation") -> np.ndarray:
+    """Render non-UI content as a clean training slide.
+
+    These scenes intentionally have no source-PDF pixels. That keeps document
+    prose, headings and metadata outside the screenshot/targeting system.
+    """
     canvas=np.full((HEIGHT,WIDTH,3),(245,246,243),dtype=np.uint8)
     cv2.rectangle(canvas,(0,0),(WIDTH,54),TEAMCENTER_ACCENT,-1)
     cv2.putText(canvas,"Teamcenter AI Studio",(24,37),cv2.FONT_HERSHEY_SIMPLEX,0.72,(255,255,255),2,cv2.LINE_AA)
-    label="EXPLANATION" if kind=="explanation" else "ACTION"
-    cv2.putText(canvas,label,(70,120),cv2.FONT_HERSHEY_SIMPLEX,0.62,TEAMCENTER_ACCENT,2,cv2.LINE_AA)
-    cv2.putText(canvas,(title or "Tutorial step")[:90],(70,175),cv2.FONT_HERSHEY_SIMPLEX,1.0,(40,45,48),2,cv2.LINE_AA)
-    y=235
-    for line in _wrap_text(body or "Continue with the tutorial.",92)[:8]:
-        cv2.putText(canvas,line,(80,y),cv2.FONT_HERSHEY_SIMPLEX,0.67,(60,65,68),2,cv2.LINE_AA); y+=38
+
+    if kind=="transition":
+        cv2.putText(canvas,"SECTION",(70,132),cv2.FONT_HERSHEY_SIMPLEX,0.70,TEAMCENTER_ACCENT,2,cv2.LINE_AA)
+        wrapped=_wrap_text(title or "Tutorial section",46)
+        y=280
+        for line in wrapped[:2]:
+            scale=1.45 if len(line)<34 else 1.10
+            (tw,_),_=cv2.getTextSize(line,cv2.FONT_HERSHEY_SIMPLEX,scale,2)
+            cv2.putText(canvas,line,((WIDTH-tw)//2,y),cv2.FONT_HERSHEY_SIMPLEX,scale,(40,45,48),2,cv2.LINE_AA)
+            y+=72
+        cv2.line(canvas,(250,430),(WIDTH-250,430),TEAMCENTER_ACCENT,3,cv2.LINE_AA)
+        return canvas
+
+    cv2.putText(canvas,"CONCEPT",(70,120),cv2.FONT_HERSHEY_SIMPLEX,0.62,TEAMCENTER_ACCENT,2,cv2.LINE_AA)
+    title_text=(title or "Concept")[:110]
+    cv2.putText(canvas,title_text,(70,175),cv2.FONT_HERSHEY_SIMPLEX,1.0,(40,45,48),2,cv2.LINE_AA)
+    cv2.rectangle(canvas,(62,215),(WIDTH-62,570),(232,235,231),-1)
+    cv2.rectangle(canvas,(62,215),(WIDTH-62,570),TEAMCENTER_ACCENT,2,cv2.LINE_AA)
+    y=270
+    for line in _wrap_text(body or "Continue with the tutorial.",88)[:9]:
+        cv2.putText(canvas,line,(88,y),cv2.FONT_HERSHEY_SIMPLEX,0.67,(60,65,68),2,cv2.LINE_AA); y+=38
     return canvas
 
 
@@ -432,7 +452,19 @@ def _click_event_progress(frame_index: int, interaction_frame: int, interaction:
 
 def _render_action_frames(writer, scene, audio_path, raw_img, cues, cumulative, previous_cursor=None, previous_screenshot=None):
     if raw_img is None:
-        base = _draw_text_scene(scene.get("title") or "Tutorial step", scene.get("caption_text") or scene.get("source_context") or scene.get("action") or "Continue with the tutorial.", scene.get("kind") or "action")
+        kind=str(scene.get("kind") or "action")
+        if kind in {"explanation","transition"}:
+            base = _draw_text_scene(
+                scene.get("title") or "Tutorial step",
+                scene.get("visual_body") or scene.get("caption_text") or scene.get("source_context") or "Continue with the tutorial.",
+                kind,
+            )
+        else:
+            base = _draw_text_scene(
+                scene.get("title") or "Tutorial step",
+                scene.get("caption_text") or scene.get("source_context") or scene.get("action") or "Visual evidence is unavailable for this action.",
+                "action",
+            )
         ox, oy, nw, nh = 0, 0, WIDTH, HEIGHT
     else:
         base, (ox, oy, nw, nh) = _fit_image(raw_img)
@@ -976,7 +1008,10 @@ def render_tutorial(
 
     print(
         f"[RENDER] Completed ONE continuous tutorial: "
-        f"{len(steps)} actions, {cumulative:.1f}s"
+        f"{sum(1 for s in steps if s.get('kind')=='action')} actions, "
+        f"{sum(1 for s in steps if s.get('kind')=='explanation')} explanations, "
+        f"{sum(1 for s in steps if s.get('kind')=='transition')} section intros, "
+        f"{cumulative:.1f}s"
     )
 
     return {

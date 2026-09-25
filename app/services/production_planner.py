@@ -13,12 +13,12 @@ from typing import Any, Dict, List, Optional
 
 from app.services.document_understanding import (
     clean_text, extract_instruction_blocks, is_metadata_page, section_title,
-    split_compound_action, line_marker, is_action_line,
+    split_compound_action, line_marker, is_action_line, extract_number,
 )
 from app.services.model_adapters import create_clients
 from app.services.targeting import action_type, ground_action, interaction_for, clear_caches
 
-SCHEMA_VERSION=4
+SCHEMA_VERSION=5
 MAX_PROMPT_CHARS=max(3000,int(os.getenv("AI_BATCH_MAX_CHARS","7500")))
 MIN_WORDS={"simple":6,"navigation":8,"form_entry":10,"complex":18,"drag_drop":10}
 MAX_WORDS={"simple":18,"navigation":22,"form_entry":26,"complex":40,"drag_drop":28}
@@ -69,6 +69,23 @@ def _context(action:str,context:str,page_text:str)->str:
 def _fallback_narration(action:str,context:str)->str:
     action=_remove_urls(action).rstrip(" .;,")
     if not action:return "Continue with the next step."
+    if len(action.split())==1:
+        fallback_by_verb={
+            "click":"Click the required control.",
+            "select":"Select the required item.",
+            "choose":"Choose the required option.",
+            "open":"Open the required item.",
+            "enter":"Enter the required value.",
+            "type":"Type the required value.",
+            "press":"Press the required key.",
+            "save":"Save the current changes.",
+            "create":"Create the requested item.",
+            "delete":"Delete the selected item.",
+            "upload":"Upload the required file.",
+            "download":"Download the required file.",
+            "search":"Search for the required item.",
+        }
+        return fallback_by_verb.get(action.lower(),f"{action.capitalize()} now.")
     ctx=_remove_urls(context).strip()
     if ctx and len((action+" "+ctx).split())<=42 and re.match(r"^[A-Z]",ctx):
         return action[:1].upper()+action[1:]+". "+ctx
@@ -185,7 +202,7 @@ def build_tutorial_plan(data:Dict[str,Any],narration_language:str="en-us",progre
     if progress_callback:progress_callback(45,"Generated contextual narration")
 
     scenes=[]; scene_by_id={}
-    for x in action_items:
+    for action_index,x in enumerate(action_items,1):
         page=next((p for p in pages if int(p.get("page") or 0)==x["page"]),{})
         page["action_bbox"]=x.get("bbox")
         grounding=ground_action(x["action"],page,assets,vision_client)
@@ -198,21 +215,45 @@ def build_tutorial_plan(data:Dict[str,Any],narration_language:str="en-us",progre
         status=grounding.get("status","unresolved")
         interaction=interaction_for(x["action"],status in {"verified","review_required"})
         scene_id=len(scenes)+1
-        scene={"id":scene_id,"scene_id":f"scene_{scene_id:05d}","section_id":0,"kind":"action","title":_remove_urls(x["action"])[:120],"source_step_number":x.get("source_step_number"),"source_substep":x.get("source_substep"),"source_page":x["page"],"source_order":x.get("source_order",0),"page_width":float(page.get("width") or 0),"page_height":float(page.get("height") or 0),"source_bbox":x.get("bbox"),"action":x["action"],"action_type":action_type(x["action"]),"target_query":grounding.get("query",""),"target_status":status,"target_review_required":bool(grounding.get("review_required")),"cursor":grounding.get("point") if status in {"verified","review_required"} else None,"cursor_path":grounding.get("points",[]) if status in {"verified","review_required"} else [],"cursor_enabled":status=="verified" and interaction!="none","cursor_source":grounding.get("source","none"),"cursor_confidence":float(grounding.get("confidence",0.0) or 0.0),"cursor_target_name":grounding.get("target_name",""),"cursor_bounding_box":grounding.get("bounding_box"),"target_debug":grounding.get("debug",{}),"interaction":interaction,"complexity":complexity(x["action"]),"narration":narr,"tts_narration":narr,"caption_text":narr,"caption":narr,"caption_urls":urls,"urls":urls,"source_context":_context(x["action"],x.get("context",""),x.get("page_text","")),"screenshot":shot.get("path") if isinstance(shot,dict) else None,"is_full_page":bool(shot and shot.get("is_full_page")),"screenshot_role":shot.get("visual_role") if shot else None,"evidence":{"candidate_screenshots":grounding.get("debug",{}).get("candidate_screenshots",[]),"target_method":grounding.get("source","none")}}
+        source_step_number=x.get("source_step_number")
+        source_substep=x.get("source_substep")
+        if source_step_number:
+            source_step_key=str(source_step_number)
+            if source_substep:
+                source_step_key=f"{source_step_key}.{source_substep}"
+        else:
+            source_step_key=f"page-{x['page']}-action-{x.get('source_order',0)+1}"
+        evidence_asset_id=shot.get("asset_id") if isinstance(shot,dict) else None
+        scene={"id":scene_id,"scene_id":f"scene_{scene_id:05d}","section_id":0,"_section_name":x["section"],"kind":"action","title":_remove_urls(x["action"])[:120],"source_step_number":source_step_number,"source_substep":source_substep,"source_step_key":source_step_key,"source_page":x["page"],"source_order":x.get("source_order",0),"sequence_index":action_index,"page_width":float(page.get("width") or 0),"page_height":float(page.get("height") or 0),"visual_role":"screenshot" if shot else "action_fallback","visual_page_role":page.get("visual_page_role"),"source_bbox":x.get("bbox"),"action":x["action"],"action_type":action_type(x["action"]),"target_query":grounding.get("query",""),"target_status":status,"target_review_required":bool(grounding.get("review_required")),"cursor":grounding.get("point") if status in {"verified","review_required"} else None,"cursor_path":grounding.get("points",[]) if status in {"verified","review_required"} else [],"cursor_enabled":status=="verified" and interaction!="none","cursor_source":grounding.get("source","none"),"cursor_confidence":float(grounding.get("confidence",0.0) or 0.0),"cursor_target_name":grounding.get("target_name",""),"cursor_bounding_box":grounding.get("bounding_box"),"target_debug":grounding.get("debug",{}),"interaction":interaction,"complexity":complexity(x["action"]),"narration":narr,"tts_narration":narr,"caption_text":narr,"caption":narr,"caption_urls":urls,"urls":urls,"source_context":_context(x["action"],x.get("context",""),x.get("page_text","")),"screenshot":shot.get("path") if isinstance(shot,dict) else None,"is_full_page":bool(shot and shot.get("is_full_page")),"screenshot_role":shot.get("visual_role") if shot else None,"evidence":{"asset_id":evidence_asset_id,"page":int(shot.get("page")) if isinstance(shot,dict) and shot.get("page") is not None else None,"page_rect":shot.get("page_rect") if isinstance(shot,dict) else None,"candidate_screenshots":grounding.get("debug",{}).get("candidate_screenshots",[]),"target_name":grounding.get("target_name",""),"target_point":grounding.get("point"),"candidate_screenshots":grounding.get("debug",{}).get("candidate_screenshots",[]),"target_method":grounding.get("source","none")}}
         scenes.append(scene); scene_by_id[scene_id]=scene
 
     for x in explanation_items:
         page=next((p for p in pages if int(p.get("page") or 0)==x["page"]),{})
-        shot=next((a for a in assets if int(a.get("page") or -1)==x["page"] and a.get("is_full_page") and a.get("visual_role")!="decorative"),None)
         scene_id=len(scenes)+1; text=_remove_urls(x["context"])
         words=text.split()
         if len(words)>42:
             text=" ".join(words[:42]).rstrip(" .")+"."
-        scenes.append({"id":scene_id,"scene_id":f"scene_{scene_id:05d}","section_id":0,"kind":"explanation","title":text[:120],"source_step_number":None,"source_substep":None,"source_page":x["page"],"source_order":x.get("source_order",0),"page_width":float(page.get("width") or 0),"page_height":float(page.get("height") or 0),"source_bbox":None,"action":"","action_type":"Follow","target_query":"","target_status":"not_applicable","target_review_required":False,"cursor":None,"cursor_enabled":False,"cursor_source":"none","cursor_confidence":0.0,"cursor_target_name":"","cursor_bounding_box":None,"target_debug":{},"interaction":"none","complexity":"simple","narration":text[:700].rstrip(" .")+".","tts_narration":text[:700].rstrip(" .")+".","caption_text":text[:700].rstrip(" .")+".","caption":text[:700].rstrip(" .")+".","caption_urls":_urls(x["context"]),"urls":_urls(x["context"]),"source_context":text,"screenshot":shot.get("path") if shot else None,"is_full_page":bool(shot and shot.get("is_full_page")),"screenshot_role":shot.get("visual_role") if shot else None,"evidence":{}})
+        scenes.append({"id":scene_id,"scene_id":f"scene_{scene_id:05d}","section_id":0,"_section_name":x["section"],"kind":"explanation","title":text[:120],"source_step_number":None,"source_substep":None,"source_step_key":f"page-{x['page']}-explanation-{x.get('source_order',0)+1}","source_page":x["page"],"source_order":x.get("source_order",0),"page_width":float(page.get("width") or 0),"page_height":float(page.get("height") or 0),"source_bbox":None,"action":"","action_type":"Follow","target_query":"","target_status":"not_applicable","target_review_required":False,"cursor":None,"cursor_enabled":False,"cursor_source":"none","cursor_confidence":0.0,"cursor_target_name":"","cursor_bounding_box":None,"target_debug":{},"interaction":"none","complexity":"simple","narration":text[:700].rstrip(" .")+".","tts_narration":text[:700].rstrip(" .")+".","caption_text":text[:700].rstrip(" .")+".","caption":text[:700].rstrip(" .")+".","caption_urls":_urls(x["context"]),"urls":_urls(x["context"]),"source_context":text,"screenshot":None,"is_full_page":False,"screenshot_role":"slide","visual_role":"slide","visual_body":text,"evidence":{}})
 
-    # Preserve source order: sort by source page, then original action insertion order,
-    # with explanation blocks kept immediately around their page-derived actions.
-    scenes.sort(key=lambda s:(int(s.get("source_page") or 0),int(s.get("source_order") or 0),0 if s.get("kind")=="action" else 1,int(s.get("source_substep") or 0),int(s.get("id") or 0)))
+    # The rendered tutorial has an explicit teaching rhythm: section title,
+    # explanation/theory, then the sequence of concrete UI actions. This keeps
+    # document prose away from the action/cursor renderer without losing source
+    # step identity on action scenes.
+    section_names=list(sections.keys())
+    section_first_page={}
+    for pidx,page in enumerate(pages):
+        name=clean_text(section_title(page)) or f"Section {pidx+1}"
+        section_first_page.setdefault(name,int(page.get("page") or pidx+1))
+    section_intro=[]
+    for name in section_names:
+        intro_id=len(scenes)+len(section_intro)+1
+        number=extract_number(name)
+        spoken=name if number is None else name
+        section_intro.append({"id":intro_id,"scene_id":f"scene_{intro_id:05d}","section_id":0,"_section_name":name,"kind":"transition","title":name[:120],"source_step_number":None,"source_section_number":number,"source_substep":None,"source_step_key":f"section-{len(section_intro)+1}","source_page":section_first_page.get(name,0),"source_order":-1,"page_width":0.0,"page_height":0.0,"source_bbox":None,"action":"","action_type":"Follow","target_query":"","target_status":"not_applicable","target_review_required":False,"cursor":None,"cursor_enabled":False,"cursor_source":"none","cursor_confidence":0.0,"cursor_target_name":"","cursor_bounding_box":None,"target_debug":{},"interaction":"none","complexity":"simple","narration":spoken.rstrip(" .")+".","tts_narration":spoken.rstrip(" .")+".","caption_text":spoken.rstrip(" .")+".","caption":spoken.rstrip(" .")+".","caption_urls":[],"urls":[],"source_context":"","screenshot":None,"is_full_page":False,"screenshot_role":"slide","visual_role":"slide","visual_body":"","evidence":{}})
+    scenes.extend(section_intro)
+    scenes.sort(key=lambda s:(section_names.index(s.get("_section_name")) if s.get("_section_name") in section_names else 999,
+                              0 if s.get("kind")=="transition" else 1 if s.get("kind")=="explanation" else 2,
+                              int(s.get("source_page") or 0),int(s.get("source_order") or 0),int(s.get("source_substep") or 0),int(s.get("id") or 0)))
     for i,s in enumerate(scenes,1):s["id"]=i;s["scene_id"]=f"scene_{i:05d}"
     id_map={old.get("scene_id"):new["scene_id"] for old,new in zip(sorted(scenes,key=lambda s:s["id"]),scenes)}
 
@@ -220,8 +261,9 @@ def build_tutorial_plan(data:Dict[str,Any],narration_language:str="en-us",progre
     section_order=list(sections.keys()); sec_idx={name:i+1 for i,name in enumerate(section_order)}
     for s in scenes:
         page=next((p for p in pages if int(p.get("page") or 0)==int(s.get("source_page") or -1)),{})
-        name=clean_text(section_title(page)) or "Untitled section"
+        name=s.get("_section_name") or clean_text(section_title(page)) or "Untitled section"
         s["section_id"]=sec_idx.get(name,1)
+        s.pop("_section_name",None)
     sections_out=[]
     for name,i in sec_idx.items():
         related=[s["id"] for s in scenes if s.get("section_id")==i]
